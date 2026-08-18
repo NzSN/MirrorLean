@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean 4.33.0)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          elan toolchain install leanprover/lean4:v4.33.0
+
+      - name: Cache .lake
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: lake-${{ runner.os }}-${{ hashFiles('lake-manifest.json', 'lean-toolchain') }}
+
+      - name: Build library
+        run: lake build
+
+      - name: Build test binary
+        run: lake build test
+
+      - name: Run unit tests
+        run: .lake/build/bin/test
+
+      - name: Build smoke binary
+        run: lake build smoke
+
+      - name: Run smoke (self-skips without MIRROR_BIN)
+        run: .lake/build/bin/smoke

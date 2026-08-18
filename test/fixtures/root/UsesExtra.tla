@@ -1,0 +1,2 @@
+---- MODULE UsesExtra ----
+EXTENDS Extra

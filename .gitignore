@@ -1,0 +1,21 @@
+# Lean / Lake build artifacts
+.lake/
+build/
+
+# Lean compiled artifacts
+*.olean
+*.ilean
+*.c
+*.o
+
+# Lean package manager
+leanpkg.path
+
+# AgentTeams state
+.agent-teams/
+
+# Apalache / mirror output
+_apalache-out/
+
+# Scratch / runtime artifacts
+tmp/

@@ -1,0 +1,2 @@
+---- MODULE UsesSame ----
+EXTENDS Same

@@ -1,0 +1,3 @@
+---- MODULE Extra ----
+VARIABLE
+  extraVar

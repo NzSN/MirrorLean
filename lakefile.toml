@@ -1,0 +1,17 @@
+name = "mirrorlean"
+defaultTargets = ["MirrorLean"]
+
+[[lean_lib]]
+name = "MirrorLean"
+
+[[lean_exe]]
+name = "test"
+root = "test.Main"
+
+[[lean_exe]]
+name = "counter-example"
+root = "examples.Counter"
+
+[[lean_exe]]
+name = "smoke"
+root = "test.Smoke"

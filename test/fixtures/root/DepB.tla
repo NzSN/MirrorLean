@@ -1,0 +1,3 @@
+---- MODULE DepB ----
+VARIABLE
+  depBVar
