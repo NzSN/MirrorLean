@@ -85,27 +85,28 @@ every `.rsp` Lake generates) contain:
 ... -Wl,--as-needed ... -lssl -lcrypto ...
 ```
 
+**The Lean 4.33 toolchain BUNDLES its own `libssl.a` / `libcrypto.a`
+(OpenSSL 3.6.0) in `<lean-sysroot>/lib/`** (the link line's `-L <sysroot>/lib`
+comes before any system dir, so `-Bstatic -lssl` resolves to the bundled
+static library — the Phase 0 spike's binary statically embeds OpenSSL 3.6.0).
 Verified semantics (lld 22.1.4, the linker Lake uses):
 
-- When the OpenSSL dev files are present but no symbols are referenced,
-  `--as-needed` drops them: baseline binaries have **no libssl/libcrypto in
-  DT_NEEDED** (`ldd` clean) and no OpenSSL symbols.
-- When the files are **absent**, lld errors `unable to find library -lssl`
-  even with `--as-needed` and zero references; the `-Bstatic` pair needs
-  `libssl.a`. → On Ubuntu, `libssl-dev` (headers + `libssl.a` + `libssl.so`
-  symlinks) is required to **link** any Lean 4.33 executable, baseline
-  included. This is a pre-existing toolchain property, not something
-  server-mode introduces.
+- When no OpenSSL symbols are referenced, `--as-needed` drops the library:
+  baseline binaries have **no libssl/libcrypto in DT_NEEDED** (`ldd` clean)
+  and no OpenSSL symbols. The link succeeds using only the toolchain's own
+  `-L` dirs — **system OpenSSL dev files are NOT needed to link any Lean 4.33
+  executable** (verified by linking a baseline-style binary with only the
+  toolchain's `-L` dirs on the search path).
+- The toolchain bundles NO OpenSSL headers (`<sysroot>/include` has only
+  `lean/` and `clang/`), so compiling our own C shim (`native/mirrorlean_tls.c`)
+  is the only place **system `libssl-dev` headers** are required — and that is
+  exactly the opt-in server-mode path.
 
-Consequence for the plan's gate wording (T1): "baseline green with **no**
-OpenSSL dev files" is not literally achievable on this toolchain — the
-baseline already needs `libssl-dev` at link time. What server-mode preserves,
-and what was verified: baseline needs **no OpenSSL headers** (no C code), has
-**no OpenSSL in its binaries**, and the root build config is unchanged. The
-existing CI baseline job is unaffected (GitHub ubuntu-latest ships
-`libssl-dev`); on truly minimal runners, `apt-get install -y libssl-dev` is
-required for any Lean 4.33 build. Suggest updating the plan's T1 row wording
-accordingly.
+Consequence: the plan's T1 gate "baseline green with no `libssl-dev`" holds
+for real — the baseline needs no OpenSSL headers, no system OpenSSL libraries,
+and has no OpenSSL in its binaries; the root build config is unchanged. Only
+the opt-in server-mode targets need `libssl-dev` (headers) at build time.
+The CI baseline job is unaffected.
 
 ## 5. Verification (all green)
 

@@ -100,11 +100,12 @@ deriving Repr
 /-- The single explicit error type for the whole client surface.
 
 Entry points return `IO (Except MirrorError α)`; this inductive covers I/O,
-JSON, protocol, register, spec-invalid, step-mismatch (with the full
+TLS, JSON, protocol, register, spec-invalid, step-mismatch (with the full
 StepMismatchReport for rendering), transport closure and preset exhaustion.
 -/
 inductive MirrorError where
   | io                (e : IO.Error)
+  | tls               (msg : String)
   | json              (msg : String)
   | specInvalid       (detail : String)
   | registerFailed    (detail : String)
@@ -124,6 +125,7 @@ signals violated state invariants that way).
 -/
 def toString : MirrorError → String
   | .io e => s!"I/O error: {e}"
+  | .tls msg => s!"TLS error: {msg}"
   | .json msg => s!"JSON error: {msg}"
   | .specInvalid d => s!"spec invalid: {d}"
   | .registerFailed d => s!"register failed: {d}"

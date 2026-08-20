@@ -102,15 +102,19 @@ private def findNewline (b : ByteArray) : Option Nat :=
   (List.range b.size).find? (fun i => b[i]! == LF)
 
 /--
-Read the next complete line from a TCP socket, buffering partial reads.
+Read the next complete newline-terminated line, buffering partial reads.
 
 Bytes accumulate in a buffer shared across calls (held in an `IO.Ref`); a single
-`recv? 4096` may deliver several lines (or a partial line), so we split on
-`\n` exactly once per call. A trailing `\r` is stripped (defensive CRLF
-handling). EOF (or a zero-byte read) with no complete line in the buffer yields
-`none`.
+`recv` may deliver several lines (or a partial line), so we split on `\n`
+exactly once per call. A trailing `\r` is stripped (defensive CRLF handling).
+EOF (a `none` from `recv`, or a zero-byte read) with no complete line in the
+buffer yields `none`.
+
+This is the shared newline-framing helper used by the TCP transport and the
+TLS transport (`MirrorLean.ServerMode`); `recv` is any action returning the
+next chunk of bytes or `none` at end-of-stream.
 -/
-private partial def recvLine (recv : IO (Option ByteArray)) (buf : IO.Ref ByteArray)
+partial def recvLine (recv : IO (Option ByteArray)) (buf : IO.Ref ByteArray)
     : IO (Option String) := do
   let b ← buf.get
   match findNewline b with

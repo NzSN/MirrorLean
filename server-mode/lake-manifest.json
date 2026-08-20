@@ -1,6 +1,13 @@
 {"version": "1.2.0",
  "packagesDir": ".lake/packages",
- "packages": [],
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "mirrorlean",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "../",
+   "configFile": "lakefile.toml"}],
  "name": "«mirrorlean-server-mode»",
  "lakeDir": ".lake",
  "fixedToolchain": false}
