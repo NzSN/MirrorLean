@@ -118,9 +118,19 @@ lean_exe "server-mode-test" where
   moreLinkObjs := #[`@/native_tls]
   moreLinkArgs := #["-lssl", "-lcrypto"]
 
-/-
+/- 
 ## Phase 2: registry discovery
 -/
+
+/--
+Env-driven server-mode example: direct (`MIRROR_HOST`/`MIRROR_PORT`,
+optional `MIRROR_CERT_SHA256` pin) or discovered (`MODELMIRRORS_REGISTRY`)
+TLS 1.3 mTLS connection, then the Counter replay over that transport.
+-/
+lean_exe "server-mode-example" where
+  root := `examples.ServerMode
+  moreLinkObjs := #[`@/native_tls]
+  moreLinkArgs := #["-lssl", "-lcrypto"]
 
 /--
 Registry-discovery tests (Phase 2): in-process stub Consul servers over

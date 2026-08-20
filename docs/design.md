@@ -34,8 +34,10 @@ oracle-mode surface of the protocol:
 
 - The mirror side itself (ModelMirrors stays in Haskell).
 - mTLS/TLS 1.3 transports and Consul service discovery (both are transport-only
-  concerns; the session protocol is identical). Designed in, deferred to a
-  follow-up unless requested.
+  concerns; the session protocol is identical). Implemented as an opt-in
+  server-mode add-on (`MirrorLean.ServerMode` + the `server-mode/` package,
+  phases 1–3); excluded from the v1 *baseline* so the core library keeps zero
+  native dependencies.
 - TLA+ parsing beyond the `EXTENDS`/`INSTANCE` closure walk needed for inline
   spec sources.
 
@@ -377,16 +379,25 @@ inductive Target
   splits on `
 `, returning `none` on `recv? = none` (EOF) or `0`-byte reads.
   `close` = `Client.shutdown`.
-- **Design note (mTLS/discovery, deferred):** TLS 1.3 + registry discovery
-  (protocol-spec §Discovery) would be a separate `Transport` implementation
-  (`connectMirrorTls` + `discoverMirror`) layered on the same `Transport`
-  interface; stdlib has no TLS stack, so this needs an FFI decision (OpenSSL) and
-  is out of v1 scope. The session protocol and all client code above
-  `Transport` need zero changes when it lands.
+- **TLS 1.3 transport + registry discovery (implemented, opt-in):**
+  `MirrorLean.ServerMode` (in the root library; native shim + executables in
+  the separate `server-mode/` package) provides `connectMirrorTls`
+  (`TlsClientConfig`: CA, client cert/key, optional server name and
+  `cert-sha256` pin) and `connectMirrorDiscovered` (`discoverMirrors` from a
+  Consul-compatible registry, per-candidate pinning, aggregated errors).
+  These are separate `Transport` producers layered on the same `Transport`
+  interface; the session protocol and all client code above `Transport` are
+  unchanged. The TLS engine is a small OpenSSL shim (`native/mirrorlean_tls.c`,
+  TLS 1.3 only, hostname/SAN verification, 0600 key check, peer-cert SHA-256)
+  linked only into server-mode targets — the baseline keeps zero OpenSSL
+  dependencies (the Lean 4.33 toolchain even bundles `libssl.a`/`libcrypto.a`,
+  so only the opt-in C shim needs system OpenSSL headers).
 - Frames must contain no raw newlines — guaranteed by `Lean.Json.compress`
-  escaping. The reader must never split on embedded ``; lines are `
+  escaping. The reader must never split on embedded `
+`; lines are `
 `-terminated
-  per spec, with a trailing `` tolerated and stripped defensively.
+  per spec, with a trailing `
+` tolerated and stripped defensively.
 
 ---
 

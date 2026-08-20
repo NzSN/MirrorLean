@@ -240,6 +240,39 @@ let t : Target := .transport (← connectMirror "192.168.1.10" 8823)
 The wire format is the same JSON-lines as stdio. Plain TCP, no TLS — use
 SSH/stunnel for untrusted networks.
 
+### TLS 1.3 transport (server mode, opt-in)
+
+For `ModelMirrors --server <port> --tls` (TLS 1.3 mutual auth), the opt-in
+`MirrorLean.ServerMode` module provides a `Transport`-compatible client:
+
+```lean
+import MirrorLean.ServerMode
+
+def cfg : ServerMode.TlsClientConfig :=
+  { caFile := "ca.crt", certFile := "client.crt", keyFile := "client.key" }
+
+-- direct connect (hostname/SNI defaults to the host; optional
+-- expectedCertSha256 pin):
+let t : Target := .transport (← ServerMode.connectMirrorTls cfg "mirror.example" 8443)
+
+-- or discover candidates from a Consul registry and try them in order
+-- with each candidate's cert-sha256 pin:
+let t : Target := .transport (← ServerMode.connectMirrorDiscovered cfg "http://consul:8500")
+```
+
+Key points: TLS 1.3 only; the server is verified against the CA and the
+hostname/SAN; the client presents `certFile`/`keyFile` (key must be mode
+`0600` on POSIX); a `cert-sha256` fingerprint is checked after the handshake
+and closes the connection on mismatch (registry pinning is fail-closed);
+client-certificate expiry (< 7 days) warns on stderr; debug logging behind
+`MIRRORLEAN_DEBUG_TLS=1` (`_PLAIN=1` for full plaintext).
+
+This is an opt-in build: baseline targets need no OpenSSL. Build the
+server-mode targets from `server-mode/` (`lake build server-mode-test`,
+`server-mode-example`) or see `server-mode/examples/ServerMode.lean` for the
+env-driven example (`MIRROR_CA`, `MIRROR_CERT`, `MIRROR_KEY`, `MIRROR_HOST`,
+`MIRROR_PORT`, `MODELMIRRORS_REGISTRY`, `MIRROR_CERT_SHA256`).
+
 ### `ApalacheConfig`
 
 | Field | Type | Description |
@@ -382,6 +415,8 @@ strictly alternate until done:
 |---|---|---|---|
 | stdio | `Target.binary` / `spawnMirror binPath` (implicit for `.binary`) | default (no args) | Local child process |
 | TCP | `connectMirror host port` | `ModelMirrors --serve <port>` | One session per connection, sequential accept loop; plain TCP, no TLS |
+| TLS 1.3 mTLS | `ServerMode.connectMirrorTls cfg host port` | `ModelMirrors --server <port> --tls --cert … --key … --ca …` | Mutual auth, CA + hostname/SAN verification, optional `cert-sha256` pin; opt-in (`server-mode/`) |
+| TLS + registry | `ServerMode.connectMirrorDiscovered cfg registryUrl` | same + Consul `/v1/health/service/modelmirrors?passing=true` | Candidates tried in order with registry `cert-sha256` pinning; fail-closed on malformed data |
 
 ## Value Format
 

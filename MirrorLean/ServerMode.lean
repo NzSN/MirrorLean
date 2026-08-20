@@ -175,4 +175,39 @@ def connectMirrorTls' (cfg : TlsClientConfig) (host : String) (port : UInt16) : 
     | .userError msg => pure (Except.error (.tls msg))
     | e => pure (Except.error (.io e))
 
+/-!
+Discover candidates from a Consul-compatible registry (`discoverMirrors`)
+and try each in order with `cert-sha256` pinning, returning the first
+`Transport` whose handshake AND fingerprint check succeed.
+
+* A candidate's registry-advertised `certSha256` becomes
+  `expectedCertSha256` for that attempt; candidates without a fingerprint
+  are attempted unpinned.
+* On failure the connection is closed and the next candidate is tried.
+* If the registry is unreachable, `discoverMirrors` throws (clear error;
+  a direct `connectMirrorTls` remains possible).
+* An empty candidate list, or every candidate failing, throws an
+  `IO.userError` with the aggregated per-candidate errors.
+-/
+def connectMirrorDiscovered (cfg : TlsClientConfig) (registryUrl : String) : IO Transport := do
+  let candidates ← discoverMirrors registryUrl
+  if candidates.isEmpty then
+    throw (IO.userError
+      s!"connectMirrorDiscovered: registry '{registryUrl}' returned no candidates")
+  let acc ← candidates.foldlM (init := (Sum.inl #[] : Sum (Array String) Transport)) fun acc c => do
+    match acc with
+    | .inr t => pure acc
+    | .inl errs =>
+        let ccfg : TlsClientConfig := { cfg with expectedCertSha256 := c.certSha256 }
+        try
+          let t ← connectMirrorTls ccfg c.host c.port
+          pure (.inr t)
+        catch e =>
+          pure (.inl (errs.push s!"{c.host}:{c.port}: {toString e}"))
+  match acc with
+  | .inr t => pure t
+  | .inl errs =>
+      throw (IO.userError
+        s!"connectMirrorDiscovered: all {candidates.size} candidate(s) failed:\n{String.intercalate "\n" errs.toList}")
+
 end MirrorLean.ServerMode

@@ -37,11 +37,22 @@ openssl x509 -req -in "$OUT/client.csr" \
   -CA "$OUT/ca.crt" -CAkey "$OUT/ca.key" -CAcreateserial \
   -out "$OUT/client.crt" -days 2 >/dev/null 2>&1
 
+# --- second server certificate (different key -> different fingerprint) ---
+# Same CA and SAN as server.crt; used by the Phase 3 pinned-discovery test
+# to offer one bad-pin candidate and one good-pin candidate.
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$OUT/server2.key" -out "$OUT/server2.csr" \
+  -subj "/CN=localhost" >/dev/null 2>&1
+openssl x509 -req -in "$OUT/server2.csr" \
+  -CA "$OUT/ca.crt" -CAkey "$OUT/ca.key" -CAcreateserial \
+  -out "$OUT/server2.crt" -days 2 \
+  -extfile <(printf '%s\n' "$SAN") >/dev/null 2>&1
+
 # --- unrelated CA (negative tests: wrong trust anchor) -------------------
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$OUT/ca2.key" -out "$OUT/ca2.crt" -days 2 \
   -subj "/CN=MirrorLean Unrelated CA" >/dev/null 2>&1
 
-chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/client.key" "$OUT/ca2.key"
+chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/server2.key" "$OUT/client.key" "$OUT/ca2.key"
 rm -f "$OUT"/*.csr "$OUT/ca.srl"
 echo "$OUT"
