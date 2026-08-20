@@ -1,5 +1,6 @@
 import MirrorLean.Transport
 import MirrorLean.Error
+import MirrorLean.ServerMode.Discovery
 
 /-!
 # MirrorLean.ServerMode
@@ -12,6 +13,8 @@ Server-mode client support for ModelMirrors (`plans/server-mode.md`):
   works unchanged over it).
 * `TlsClientConfig` — CA, client certificate/key, optional server name
   (SNI/hostname verification) and optional `cert-sha256` fingerprint pin.
+* Discovery (Phase 2, `MirrorLean.ServerMode.Discovery`, re-imported here):
+  `ServiceInfo`, `RegistryUrl`, `discoverMirrors`.
 
 The TLS engine is a small native shim (`native/mirrorlean_tls.c`) linked
 into this package's targets via `-lssl -lcrypto`; `MirrorLean.Transport`
