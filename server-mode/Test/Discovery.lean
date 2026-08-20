@@ -60,9 +60,12 @@ private def startStub (respond : Std.Async.TCP.Socket.Client → IO Unit)
   server.bind (Std.Net.SocketAddress.v4 { addr := Std.Net.IPv4Addr.ofParts 127 0 0 1, port := 0 })
   server.listen 5
   let sockName ← server.getSockName
-  let acceptTask ← IO.asTask (Std.Async.Async.block server.accept)
+  -- Accept inside the serve task itself. (An `IO.asTask` body whose FIRST
+  -- action is `Task.get` on a still-pending task hard-blocks the spawning
+  -- thread in the Lean runtime; starting with the accept's `Async.block`
+  -- yields properly, as the root test/Main.lean loopback pattern shows.)
   let serveTask ← IO.asTask do
-    let client ← IO.ofExcept acceptTask.get
+    let client ← Std.Async.Async.block server.accept
     respond client
   pure (sockName.port, serveTask)
 
@@ -84,12 +87,13 @@ private def http200 (body : String) : String :=
 private def hexDigitChar (n : Nat) : Char :=
   if n < 10 then Char.ofNat ('0'.toNat + n) else Char.ofNat ('a'.toNat + (n - 10))
 
-private partial def hexOfAux (m : Nat) (acc : String) : String :=
-  if m == 0 then (if acc.isEmpty then "0" else acc)
-  else hexOfAux (m / 16) (String.push acc (hexDigitChar (m % 16)))
+private partial def hexOfAux (m : Nat) : String :=
+  if m == 0 then ""
+  else hexOfAux (m / 16) ++ String.singleton (hexDigitChar (m % 16))
 
 private def hexOf (n : Nat) : String :=
-  hexOfAux n ""
+  let s := hexOfAux n
+  if s.isEmpty then "0" else s
 
 /-- A chunked-encoded response body (one chunk per string in `chunks`). -/
 private def chunked (chunks : List String) : String :=
@@ -220,23 +224,31 @@ def testDiscoverNon200 : IO Bool := do
   checkEq "discover non-200: empty" (toString found.size) "0"
 
 def testDiscoverGarbage : IO Bool := do
-  -- Bytes that are not HTTP at all: fail closed, never throw.
+  -- Bytes that are not HTTP at all (and never get a newline): the partial
+  -- status line fails closed to #[] after the read timeout.
   let (port, _) ← startStub (fun client => do
     Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client "hello garbage".toUTF8)
     closeWrite client)
-  let found ← discoverMirrors s!"http://127.0.0.1:{port}"
+  let found ← discoverMirrors s!"http://127.0.0.1:{port}" 300
   checkEq "discover garbage: empty" (toString found.size) "0"
 
 def testDiscoverClosed : IO Bool := do
-  -- Connection closed before any response: fail closed, never throw.
+  -- Connection closed before any response. With the Lean 4.33 TCP API a
+  -- peer-closed socket reads exactly like an idle one (no EOF flag), so
+  -- this surfaces as a read timeout, not fail-closed `#[]`.
   let (port, _) ← startStub closeWrite
-  let found ← discoverMirrors s!"http://127.0.0.1:{port}"
-  checkEq "discover closed: empty" (toString found.size) "0"
+  try
+    let _ ← discoverMirrors s!"http://127.0.0.1:{port}" 300
+    check "discover closed: throws" false
+  catch e =>
+    check "discover closed: throws" ((toString e).contains "timed out")
 
 def testDiscoverChunked : IO Bool := do
   let body := "[{\"Service\":{\"Address\":\"127.0.0.1\",\"Port\":8443,\"Meta\":{\"cert-sha256\":\"cc\"}}}]"
   let resp := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++ chunked [body]
-  let (port, _) ← startStub (fun client =>
+  let (port, _) ← startStub (fun client => do
+    -- Read the request first: closing a socket with unread data sends RST.
+    discard (Std.Async.Async.block (Std.Async.TCP.Socket.Client.recv? client 4096))
     Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client resp.toUTF8))
   let found ← discoverMirrors s!"http://127.0.0.1:{port}"
   let a ← checkEq "discover chunked: count" (toString found.size) "1"
@@ -249,9 +261,12 @@ def testDiscoverNoContentLength : IO Bool := do
   let body := "[{\"Service\":{\"Address\":\"127.0.0.1\",\"Port\":8443}}]"
   let resp := "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" ++ body
   let (port, _) ← startStub (fun client => do
+    discard (Std.Async.Async.block (Std.Async.TCP.Socket.Client.recv? client 4096))
     Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client resp.toUTF8)
     closeWrite client)
-  let found ← discoverMirrors s!"http://127.0.0.1:{port}"
+  -- Small timeoutMs: the read-until-silence fallback waits one full
+  -- timeout after the body arrives (EOF is undetectable on this stdlib).
+  let found ← discoverMirrors s!"http://127.0.0.1:{port}" 400
   let a ← checkEq "discover eof-framed: count" (toString found.size) "1"
   let b ← check "discover eof-framed: candidate" (found.size > 0 &&
     found[0]!.host == "127.0.0.1" && found[0]!.port == 8443)

@@ -1,9 +1,6 @@
 import Std.Async.TCP
 import Std.Async.DNS
-import Std.Async.Select
-import Std.Async.Timer
 import Std.Net
-import Std.Time
 import Lean.Data.Json
 
 /-!
@@ -36,24 +33,43 @@ This module provides:
   socket send failure, or a read timeout (no response bytes within
   `timeoutMs`). This is reported distinctly from "no candidates" so that
   `connectMirrorDiscovered` (Phase 3) can fall back to a direct connection.
+  Because the Lean 4.33 TCP API cannot distinguish "no data yet" from a
+  peer-closed connection (see below), a connection that closes without
+  sending a response also surfaces as a read timeout.
 * **Returns `#[]`** for everything else, matching the upstream ModelMirrors
   client (`Protocol/Registry.hs` `discoverServices`, which fails closed on
-  any registry or parsing error): any received-but-unusable response —
-  connection closed before a complete body, malformed status line / headers /
-  chunk framing, invalid `Content-Length`, a non-200 status, malformed JSON,
-  or JSON that is not an array — yields `#[]`. Entries that do not decode to
-  a usable `ServiceInfo` (missing `Service`, empty `Address`, out-of-range
-  `Port`) are skipped.
+  any registry or parsing error): any complete-but-unusable response —
+  malformed status line / headers / chunk framing, invalid `Content-Length`,
+  a non-200 status, malformed JSON, or JSON that is not an array — yields
+  `#[]`. Entries that do not decode to a usable `ServiceInfo` (missing
+  `Service`, empty `Address`, out-of-range `Port`) are skipped.
 
 ## The HTTP client
 
 Deliberately minimal (plan §4 D3): a single HTTP/1.1 `GET` over
 `Std.Async.TCP` with `Connection: close`, supporting `Content-Length`,
-read-to-EOF and chunked bodies, and a bounded read timeout implemented by
-racing the socket reader against a timer selector with
-`Std.Async.Selectable.one`. The Lean 4.33 stdlib ships no HTTP *client*
-(`Std.Http` is a sans-I/O server library), and MirrorLean stays
-dependency-free, so the ~150 lines here are the whole stack.
+read-until-silence and chunked bodies, and a bounded read timeout.
+
+**Stdlib reality check (Lean 4.33):** `Std.Async.TCP.Socket.Client.recv?`
+is non-blocking — it returns `some` bytes when data is pending and `none`
+when there is no data right now, and `none` does *not* mean EOF: an idle
+socket, a peer-closed socket, and `waitReadable`-resolved sockets all read
+as `none` (verified empirically; no EOF flag is exposed by the API). So
+this client polls `recv?` every 5 ms with a `timeoutMs` deadline and treats
+silence as either "more data is coming" (keep polling) or, once the
+deadline passes, "the registry hung" (throw). Consequences, all
+documented here so Phase 3 and the tests rely on the real semantics:
+
+* `readToEnd` (bodies without `Content-Length`) returns what it has after a
+  full `timeoutMs` of silence — the closest analogue of read-to-EOF
+  available; Consul itself always sends `Content-Length`.
+* A truncated `Content-Length`/chunked body (peer stopped sending early)
+  throws as a timeout, not fail-closed `#[]`.
+* A connection closed before any response throws as a timeout.
+
+The Lean 4.33 stdlib ships no HTTP *client* (`Std.Http` is a sans-I/O
+server library), and MirrorLean stays dependency-free, so the ~200 lines
+here are the whole stack.
 -/
 
 namespace MirrorLean.ServerMode
@@ -158,106 +174,107 @@ private def findByte (b : ByteArray) (c : UInt8) : Option Nat :=
 private def stripCr (s : String) : String :=
   if s.endsWith "\r" then (s.dropEnd 1).toString else s
 
-/-- The outcome of one timed socket read. -/
-private inductive ReadOutcome where
-  | data (bs : ByteArray)
-  | eof
-  | timedOut
-
 /--
-Read up to `size` bytes from `client` within `timeoutMs` milliseconds.
+Try one bounded socket read.
 
-Races the socket read against a timer with `Std.Async.Selectable.one`; a
-timer win is reported as `timedOut` (the socket stays usable for a later
-read).
+Lean 4.33's `Std.Async.TCP.Socket.Client.recv?` is **non-blocking**: it
+returns `some` bytes when data is pending and `none` when no data is
+available right now — and it cannot distinguish "no data yet" from a
+peer-closed connection (the `waitReadable`/`recvSelector` machinery
+resolves for all three states, and no EOF flag is exposed). So we poll
+`recv?` every 5 ms until data arrives or the `timeoutMs` budget is
+exhausted. `none` therefore means **timed out**, never EOF.
 -/
+private partial def tryRecv (client : Std.Async.TCP.Socket.Client) (size : UInt64) (timeoutMs : Nat)
+    : IO (Option ByteArray) := do
+  let polls := (timeoutMs / 5) + 1
+  let rec go (n : Nat) : IO (Option ByteArray) := do
+    match ← Std.Async.Async.block (Std.Async.TCP.Socket.Client.recv? client size) with
+    | some bs => pure (some bs)
+    | none =>
+        if n == 0 then pure none
+        else do
+          IO.sleep 5
+          go (n - 1)
+  go polls
+
+/-- A bounded read that throws `IO.userError` on timeout (the registry hung). -/
 private def recvWithTimeout (client : Std.Async.TCP.Socket.Client) (size : UInt64) (timeoutMs : Nat)
-    : IO ReadOutcome := do
-  let sleepSel ← Std.Async.Async.block (Std.Async.Selector.sleep (Std.Time.Millisecond.Offset.ofNat timeoutMs))
-  let recvSel : Std.Async.Selectable ReadOutcome :=
-    { selector := Std.Async.TCP.Socket.Client.recvSelector client size
-      cont := fun bs => pure (match bs with
-        | some b => ReadOutcome.data b
-        | none   => ReadOutcome.eof) }
-  let timerSel : Std.Async.Selectable ReadOutcome :=
-    { selector := sleepSel
-      cont := fun _ => pure ReadOutcome.timedOut }
-  Std.Async.Async.block (Std.Async.Selectable.one #[recvSel, timerSel])
+    : IO ByteArray := do
+  match ← tryRecv client size timeoutMs with
+  | some bs => pure bs
+  | none => throw (IO.userError "registry request timed out")
 
 /-- A buffered, timed reader over a raw socket, used for the registry HTTP
 exchange. -/
 structure HttpBuf where
   client : Std.Async.TCP.Socket.Client
   buf : IO.Ref ByteArray
-  eof : IO.Ref Bool
   timeoutMs : Nat
 
 /--
-Append one socket read to the buffer; returns `false` at end of input.
-
-Throws `IO.userError` on a read timeout (the registry hung) — the
-"registry unavailable" case is reported distinctly from "no candidates".
+Append one socket read to the buffer; throws `IO.userError` on a read
+timeout (the registry hung) — the "registry unavailable" case is reported
+distinctly from "no candidates".
 -/
-private def fill (hb : HttpBuf) : IO Bool := do
-  let b ← hb.buf.get
-  match ← recvWithTimeout hb.client 4096 hb.timeoutMs with
-  | .timedOut => throw (IO.userError "registry request timed out")
-  | .eof =>
-      hb.eof.set true
-      pure false
-  | .data bs =>
-      if bs.isEmpty then
-        hb.eof.set true
-        pure false
-      else
-        hb.buf.set (b ++ bs)
-        pure true
+private def fill (hb : HttpBuf) : IO Unit := do
+  let bs ← recvWithTimeout hb.client 4096 hb.timeoutMs
+  if bs.isEmpty then
+    throw (IO.userError "registry socket returned an empty read")
+  else
+    hb.buf.set ((← hb.buf.get) ++ bs)
 
 /--
-Read the next `\n`-terminated line (stripping a trailing `\r`), or `none` at
-end of input.
+Read the next `\n`-terminated line (stripping a trailing `\r`).
+
+On timeout, a **partial** line that was already received is returned so the
+caller can fail closed on it (e.g. garbage that never got a newline ->
+malformed status line -> `#[]`); a timeout with **no data at all** rethrows
+(the registry never answered -> "unavailable").
 -/
-private partial def readLine (hb : HttpBuf) : IO (Option String) := do
+private partial def readLine (hb : HttpBuf) : IO String := do
   let b ← hb.buf.get
   match findByte b LF with
   | some i =>
       let lineBytes := b.extract 0 i
       hb.buf.set (b.extract (i + 1) b.size)
-      pure (some (stripCr (String.fromUTF8? lineBytes |>.getD "")))
+      pure (stripCr (String.fromUTF8? lineBytes |>.getD ""))
   | none =>
-      if ← hb.eof.get then pure none
-      else
-        match ← fill hb with
-        | false => pure none
-        | true => readLine hb
+      try
+        fill hb
+        readLine hb
+      catch e =>
+        let b' ← hb.buf.get
+        if b'.isEmpty then throw e
+        else do
+          hb.buf.set ByteArray.empty
+          pure (stripCr (String.fromUTF8? b' |>.getD ""))
 
-/-- Read exactly `n` bytes, or report an error if input ends first. -/
-private partial def readExact (hb : HttpBuf) (n : Nat) : IO (Except String ByteArray) := do
+/-- Read exactly `n` bytes; throws `IO.userError` on timeout (truncated
+response — the peer stopped sending before the declared length). -/
+private partial def readExact (hb : HttpBuf) (n : Nat) : IO ByteArray := do
   let b ← hb.buf.get
   if b.size ≥ n then
     hb.buf.set (b.extract n b.size)
-    pure (.ok (b.extract 0 n))
-  else
-    if ← hb.eof.get then
-      pure (.error "connection closed mid-response (truncated body)")
-    else
-      match ← fill hb with
-      | false => pure (.error "connection closed mid-response (truncated body)")
-      | true => readExact hb n
+    pure (b.extract 0 n)
+  else do
+    fill hb
+    readExact hb n
 
-/-- Read the rest of the input (until end of input). -/
+/--
+Read until a full timeout passes with no new data (`Connection: close` was
+sent, so silence means the body is complete; peer-close cannot be detected
+directly with the Lean 4.33 TCP API). Returns the accumulated bytes.
+-/
 private partial def readToEnd (hb : HttpBuf) : IO ByteArray := do
-  if ← hb.eof.get then
-    let b ← hb.buf.get
-    hb.buf.set ByteArray.empty
-    pure b
-  else
-    match ← fill hb with
-    | false =>
-        let b ← hb.buf.get
-        hb.buf.set ByteArray.empty
-        pure b
-    | true => readToEnd hb
+  match ← tryRecv hb.client 4096 hb.timeoutMs with
+  | none =>
+      let b ← hb.buf.get
+      hb.buf.set ByteArray.empty
+      pure b
+  | some bs =>
+      hb.buf.set ((← hb.buf.get) ++ bs)
+      readToEnd hb
 
 private def hexDigit (c : Char) : Option Nat :=
   if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
@@ -280,37 +297,34 @@ private def parseHex (s : String) : Option Nat :=
 /-- Consume chunked trailers (lines after the terminating `0` chunk) up to
 the empty line; the payload was already collected in `acc`. -/
 private partial def readChunkTrailers (hb : HttpBuf) (acc : ByteArray) : IO (Except String ByteArray) := do
-  match ← readLine hb with
-  | none => pure (.error "connection closed in chunked trailers")
-  | some "" => pure (.ok acc)
-  | some _ => readChunkTrailers hb acc
+  let line ← readLine hb
+  if line.isEmpty then pure (.ok acc) else readChunkTrailers hb acc
 
-/-- Decode a chunked-encoded body, collecting the payload into `acc`. -/
+/-- Decode a chunked-encoded body, collecting the payload into `acc`.
+
+Chunk framing errors are reported as `.error` (the caller fails closed to
+`#[]`); a read timeout mid-chunk throws (the registry hung / truncated the
+response at the transport level).
+-/
 private partial def readChunked (hb : HttpBuf) (acc : ByteArray) : IO (Except String ByteArray) := do
-  match ← readLine hb with
-  | none => pure (.error "connection closed mid-chunk (truncated body)")
-  | some line =>
-      let sizeStr :=
-        match line.splitOn ";" with
-        | sizePart :: _ => (sizePart.trimAscii).toString
-        | [] => ""
-      if sizeStr.isEmpty then
-        pure (.error s!"malformed chunk size (empty line: {line})")
-      else
-        match parseHex sizeStr with
-        | none => pure (.error s!"malformed chunk size: {line}")
-        | some 0 => readChunkTrailers hb acc
-        | some n =>
-            match ← readExact hb n with
-            | .error e => pure (.error e)
-            | .ok chunk =>
-                match ← readExact hb 2 with
-                | .error e => pure (.error e)
-                | .ok term =>
-                    if term ≠ (ByteArray.mk #[CR, LF]) then
-                      pure (.error "malformed chunk terminator")
-                    else
-                      readChunked hb (acc ++ chunk)
+  let line ← readLine hb
+  let sizeStr :=
+    match line.splitOn ";" with
+    | sizePart :: _ => (sizePart.trimAscii).toString
+    | [] => ""
+  if sizeStr.isEmpty then
+    pure (.error s!"malformed chunk size (empty line: {line})")
+  else
+    match parseHex sizeStr with
+    | none => pure (.error s!"malformed chunk size: {line}")
+    | some 0 => readChunkTrailers hb acc
+    | some n =>
+        let chunk ← readExact hb n
+        let term ← readExact hb 2
+        if term ≠ (ByteArray.mk #[CR, LF]) then
+          pure (.error "malformed chunk terminator")
+        else
+          readChunked hb (acc ++ chunk)
 
 private def parseHeaderLine (line : String) : Option (String × String) :=
   match indexOfChar line ':' with
@@ -321,16 +335,15 @@ private def parseHeaderLine (line : String) : Option (String × String) :=
       if name.isEmpty then none else some (name, value)
 
 private partial def readHeaders (hb : HttpBuf) : IO (Except String (Array (String × String))) := do
-  match ← readLine hb with
-  | none => pure (.error "connection closed before the response headers completed")
-  | some "" => pure (.ok #[])
-  | some line =>
-      match parseHeaderLine line with
-      | none => pure (.error s!"malformed response header: {line}")
-      | some h =>
-          match ← readHeaders hb with
-          | .error e => pure (.error e)
-          | .ok rest => pure (.ok (rest.push h))
+  let line ← readLine hb
+  if line.isEmpty then pure (.ok #[])
+  else
+    match parseHeaderLine line with
+    | none => pure (.error s!"malformed response header: {line}")
+    | some h =>
+        match ← readHeaders hb with
+        | .error e => pure (.error e)
+        | .ok rest => pure (.ok (rest.push h))
 
 private def headerVal (headers : Array (String × String)) (name : String) : Option String :=
   match headers.find? (fun (n, _) => n == name) with
@@ -353,13 +366,11 @@ private def parseStatusLine (line : String) : Except String Nat := do
 
 /-- Read status lines, skipping informational (1xx) ones. -/
 private partial def readStatus (hb : HttpBuf) : IO (Except String Nat) := do
-  match ← readLine hb with
-  | none => pure (.error "connection closed before a response")
-  | some line =>
-      match parseStatusLine line with
-      | .error _ => pure (.error s!"malformed HTTP status line: {line}")
-      | .ok code =>
-          if code / 100 == 1 then readStatus hb else pure (.ok code)
+  let line ← readLine hb
+  match parseStatusLine line with
+  | .error _ => pure (.error s!"malformed HTTP status line: {line}")
+  | .ok code =>
+      if code / 100 == 1 then readStatus hb else pure (.ok code)
 
 /--
 Read the response body per the framing headers: chunked wins over
@@ -375,7 +386,9 @@ private def readBody (hb : HttpBuf) (headers : Array (String × String)) : IO (E
     | some cl =>
         match (cl.trimAscii).toString.toNat? with
         | none => pure (.error s!"invalid Content-Length header: {cl}")
-        | some n => readExact hb n
+        | some n =>
+            let b ← readExact hb n
+            pure (.ok b)
     | none =>
         let b ← readToEnd hb
         pure (.ok b)
@@ -425,8 +438,7 @@ private def httpGet (url : RegistryUrl) (timeoutMs : Nat) : IO (Except String Ht
     "Accept: application/json\r\n\r\n"
   Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client req.toUTF8)
   let buf ← IO.mkRef (ByteArray.empty : ByteArray)
-  let eof ← IO.mkRef false
-  let hb : HttpBuf := { client := client, buf := buf, eof := eof, timeoutMs := timeoutMs }
+  let hb : HttpBuf := { client := client, buf := buf, timeoutMs := timeoutMs }
   match ← readStatus hb with
   | .error e => pure (.error e)
   | .ok status =>
