@@ -2,17 +2,25 @@ import MirrorLean.ServerMode
 import MirrorLean.Transport
 
 /-!
-# MirrorLean server-mode loopback tests (Phase 1)
+# MirrorLean server-mode loopback tests (Phase 1 + Phase 4)
 
-Runs `openssl s_server -rev -Verify 1 -tls1_3` with an ephemeral PKI
-(`test/gen-test-certs.sh`) and drives it with `MirrorLean.ServerMode`:
+Runs `openssl s_server -Verify 1 -tls1_3` (the fast TLS peer — no apalache
+needed) with an ephemeral PKI (`test/gen-test-certs.sh`) and drives it with
+`MirrorLean.ServerMode`. Covers the plan's TLS matrix rows:
 
-* happy path: send a palindrome, receive it echoed back (the server
-  reverses text), close cleanly;
-* peer fingerprint pinning: correct `cert-sha256` connects, a wrong pin
-  is rejected before any traffic;
-* wrong CA, hostname mismatch, and insecure key-file mode all fail with
-  clear errors.
+* T2-lite happy path: send a palindrome, receive it echoed back (the server
+  reverses text with `-rev`), close cleanly;
+* T3 wrong CA (server cert signed by an unrelated CA) -> handshake rejected;
+* T4 missing client cert file -> setup error; client cert signed by an
+  unrelated CA -> server rejects the handshake;
+* T5 hostname mismatch -> verification fails;
+* T6 TLS 1.2-only peer -> the TLS 1.3-only client fails;
+* T7 fingerprint pinning: correct `cert-sha256` connects, a wrong pin is
+  rejected before any traffic;
+* T8 group/other-readable key file (0644) -> rejected before connect;
+* T11 pinned discovery: bad pin candidate skipped, good candidate used;
+* T13 EOF mid-session: server closes right after the handshake -> `recv`
+  returns `none` (the same `transportClosed` semantics as plain TCP).
 
 Requires `openssl` on PATH. `main` must stay top-level (exe root module).
 -/
@@ -46,24 +54,48 @@ def findFreePort : IO UInt16 := do
   if free then pure p else throw (IO.userError "no free test port found")
 
 /-- Spawn the TLS echo server with cert stem `stem` ("server" or "server2"),
-one connection then exit. -/
-def spawnServerWith (port : UInt16) (stem : String) (dir : String) : IO (IO.Process.Child (IO.Process.StdioConfig.mk IO.Process.Stdio.piped IO.Process.Stdio.inherit IO.Process.Stdio.inherit)) := do
+`protocol` ("-tls1_3" or "-tls1_2"), one connection then exit.
+
+`verifyReturnError` mirrors the real ModelMirrors server behavior: a client
+certificate that does not verify against the CA aborts the handshake
+(`openssl s_server` only *logs* verification failures by default and keeps
+the connection; `-verify_return_error` makes it reject, like
+`tls-server-params` `requireClientCert` in ModelMirrors). -/
+def spawnServerWith (port : UInt16) (stem : String) (dir : String) (protocol : String)
+    (verifyReturnError : Bool := true) : IO (IO.Process.Child (IO.Process.StdioConfig.mk IO.Process.Stdio.piped IO.Process.Stdio.inherit IO.Process.Stdio.inherit)) := do
   let args : IO.Process.SpawnArgs :=
     { cmd := "openssl",
-      args := #["s_server", "-rev", "-Verify", "1", "-tls1_3", "-quiet",
-                "-accept", toString port,
-                "-cert", dir ++ "/" ++ stem ++ ".crt",
-                "-key", dir ++ "/" ++ stem ++ ".key",
-                "-CAfile", dir ++ "/ca.crt",
-                "-naccept", "1"],
+      args := #["s_server", "-rev", "-Verify", "1", protocol, "-quiet"] ++
+                (if verifyReturnError then #["-verify_return_error"] else #[]) ++
+                #["-accept", toString port,
+                  "-cert", dir ++ "/" ++ stem ++ ".crt",
+                  "-key", dir ++ "/" ++ stem ++ ".key",
+                  "-CAfile", dir ++ "/ca.crt",
+                  "-naccept", "1"],
       stdin := .piped, stdout := .inherit, stderr := .inherit }
   IO.Process.spawn args
 
-/-- Spawn the TLS echo server with the default server certificate. -/
+/-- Spawn the TLS 1.3 echo server with the default server certificate. -/
 def spawnServer (port : UInt16) (dir : String) :=
-  spawnServerWith port "server" dir
+  spawnServerWith port "server" dir "-tls1_3"
 
-/-- Run `body` against a fresh server; always kill + reap the server. -/
+/-- Spawn an s_server that closes the connection immediately after the
+handshake: stdin comes from `/dev/null`, and with no input to relay the
+server shuts the TLS session down (clean EOF for the client). Used by the
+T13 "mirror closes mid-session" test. -/
+def spawnServerEof (port : UInt16) (dir : String) : IO (IO.Process.Child (IO.Process.StdioConfig.mk IO.Process.Stdio.piped IO.Process.Stdio.inherit IO.Process.Stdio.inherit)) := do
+  let args : IO.Process.SpawnArgs :=
+    { cmd := "sh",
+      args := #["-c",
+                "openssl s_server -Verify 1 -tls1_3 -quiet " ++
+                "-accept " ++ toString port ++ " " ++
+                "-cert " ++ dir ++ "/server.crt " ++
+                "-key " ++ dir ++ "/server.key " ++
+                "-CAfile " ++ dir ++ "/ca.crt -naccept 1 < /dev/null"],
+      stdin := .piped, stdout := .inherit, stderr := .inherit }
+  IO.Process.spawn args
+
+/-- Run `body` against a fresh TLS 1.3 server; always kill + reap. -/
 def withServer (dir : String) (body : UInt16 → IO α) : IO α := do
   let port ← findFreePort
   let child ← spawnServer port dir
@@ -190,10 +222,10 @@ def testDiscovered (dir : String) : IO Bool := do
   -- (a) bad pin then good pin -> connects to the good candidate.
   ok := ok && (← do
     let portA ← findFreePort
-    let childA ← spawnServerWith portA "server" dir
+    let childA ← spawnServerWith portA "server" dir "-tls1_3"
     waitReady portA
     let portB ← findFreePort  -- after A is listening, so B differs
-    let childB ← spawnServerWith portB "server2" dir
+    let childB ← spawnServerWith portB "server2" dir "-tls1_3"
     waitReady portB
     let body := stubRegistryBody "127.0.0.1" portA portB fpB
     let (regPort, _) ← startStubRegistry (httpJson body)
@@ -234,7 +266,7 @@ def testDiscovered (dir : String) : IO Bool := do
   -- (c) all candidates fail -> aggregated error.
   ok := ok && (← do
     let portA ← findFreePort
-    let childA ← spawnServerWith portA "server" dir
+    let childA ← spawnServerWith portA "server" dir "-tls1_3"
     waitReady portA
     let body := "[" ++ consulEntry "127.0.0.1" portA (some "0000000000000000000000000000000000000000000000000000000000000000") ++ "]"
     let (regPort, _) ← startStubRegistry (httpJson body)
@@ -343,6 +375,86 @@ def main : IO UInt32 := do
         else do
           IO.println s!"FAIL  key permission: error {repr msg}"
           pure false)
+
+  -- 7. (T4) client cert signed by an unrelated CA: the server (started with
+  -- `-Verify 1 -verify_return_error` against ca.crt) rejects the handshake.
+  -- In TLS 1.3 the server's Finished arrives before it processes the
+  -- client's certificate, so the client's connect may complete and the
+  -- rejection surfaces on the first I/O instead — either way the session
+  -- must fail before any protocol traffic flows.
+  ok := ok && (← withServer dir fun port => do
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client-bad.crt", keyFile := dir ++ "/client-bad.key" }
+    try
+      let t ← retryConnect cfg "127.0.0.1" port 20
+      t.send "hello"
+      let _ ← t.recv
+      let _ ← t.close
+      IO.println "FAIL  invalid client cert: session unexpectedly usable after server rejection"
+      pure false
+    catch e =>
+      let msg := toString e
+      if msg.contains "TLS send" || msg.contains "TLS recv" || msg.contains "handshake" then do
+        IO.println "PASS  invalid client cert: server rejected (failure on first I/O)"
+        IO.println s!"      (error: {msg})"
+        pure true
+      else do
+        IO.println s!"FAIL  invalid client cert: unexpected error {repr msg}"
+        pure false)
+
+  -- 8. (T4) missing client certificate file fails at setup, before any
+  -- connection is attempted (no server needed).
+  ok := ok && (← do
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/does-not-exist.crt", keyFile := dir ++ "/client.key" }
+    try
+      let _ ← ServerMode.connectMirrorTls cfg "127.0.0.1" 1
+      IO.println "FAIL  missing client cert: connect unexpectedly succeeded"
+      pure false
+    catch e =>
+      let msg := toString e
+      if msg.contains "cannot load client certificate" then do
+        IO.println "PASS  missing client cert: setup error before connect"
+        pure true
+      else do
+        IO.println s!"FAIL  missing client cert: error {repr msg}"
+        pure false)
+
+  -- 9. (T6) a TLS 1.2-only peer: the TLS 1.3-only client must fail.
+  ok := ok && (← do
+    let port ← findFreePort
+    let child ← spawnServerWith port "server" dir "-tls1_2"
+    waitReady port
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
+    let res ← expectFailure "TLS 1.2 peer rejected (TLS 1.3-only client)" "handshake" cfg "127.0.0.1" port 20
+    cleanupServer child
+    pure res)
+
+  -- 10. (T13) server closes right after the handshake: recv returns none
+  -- (EOF), the same transportClosed semantics as plain TCP.
+  ok := ok && (← do
+    let port ← findFreePort
+    let child ← spawnServerEof port dir
+    waitReady port
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
+    let mut res := true
+    try
+      let t ← retryConnect cfg "127.0.0.1" port 20
+      let line ← t.recv
+      let line2 ← t.recv
+      let _ ← t.close
+      if line == none && line2 == none then
+        IO.println "PASS  EOF mid-session: recv returns none (transportClosed)"
+      else do
+        IO.println s!"FAIL  EOF mid-session: expected none, got {line} / {line2}"
+        res := false
+    catch e =>
+      IO.println s!"FAIL  EOF mid-session: {toString e}"
+      res := false
+    cleanupServer child
+    pure res)
 
   -- Phase 3: pinned discovery.
   ok := ok && (← testDiscovered dir)

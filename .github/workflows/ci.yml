@@ -5,6 +5,11 @@ on:
   pull_request:
 
 jobs:
+  # Baseline: builds the root package only. This is the explicit
+  # no-server-mode build (plans/server-mode.md T1): the `server-mode/`
+  # package is never built here, no OpenSSL dev files are installed, and
+  # the verification step below asserts the baseline binaries do not link
+  # against libssl/libcrypto.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -37,3 +42,59 @@ jobs:
 
       - name: Run smoke (self-skips without MIRROR_BIN)
         run: .lake/build/bin/smoke
+
+      - name: Verify baseline has no server-mode/OpenSSL linkage
+        run: |
+          # T1: baseline binaries must not link the server-mode shim.
+          if ldd .lake/build/bin/test .lake/build/bin/smoke | grep -iE 'libssl|libcrypto'; then
+            echo "baseline binaries unexpectedly link OpenSSL" >&2
+            exit 1
+          fi
+          test ! -e .lake/build/bin/server-mode-test
+          echo "baseline is server-mode-free"
+
+  # Server mode: opt-in package with the native TLS shim. Installs
+  # libssl-dev + openssl explicitly; builds every server-mode test binary
+  # and runs the loopback (openssl s_server), stub-registry, real-Consul
+  # (self-skips without CONSUL_BIN), and real-E2E (self-skips without
+  # MIRROR_BIN) suites. Covers T2-T13 via the loopback + stub tests.
+  server-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean 4.33.0)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          elan toolchain install leanprover/lean4:v4.33.0
+
+      - name: Install OpenSSL dev headers + openssl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev openssl
+
+      - name: Cache server-mode .lake
+        uses: actions/cache@v4
+        with:
+          path: server-mode/.lake
+          key: servermode-lake-${{ runner.os }}-${{ hashFiles('server-mode/lake-manifest.json', 'server-mode/lean-toolchain') }}
+
+      - name: Build server-mode package (default targets)
+        run: cd server-mode && lake build
+
+      - name: Build all server-mode test binaries
+        run: cd server-mode && lake build server-mode-test server-mode-test-discovery server-mode-test-consul server-mode-smoke server-mode-example
+
+      - name: Run loopback TLS tests (openssl s_server, T2-T13 subset)
+        run: cd server-mode && .lake/build/bin/server-mode-test
+
+      - name: Run registry stub tests (T9-T12)
+        run: cd server-mode && .lake/build/bin/server-mode-test-discovery
+
+      - name: Run real-Consul test (T14; self-skips without CONSUL_BIN)
+        run: cd server-mode && .lake/build/bin/server-mode-test-consul
+
+      - name: Run real E2E smoke (T15; self-skips without MIRROR_BIN)
+        run: cd server-mode && .lake/build/bin/server-mode-smoke

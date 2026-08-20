@@ -468,6 +468,58 @@ lake build smoke
 Without `MIRROR_BIN` the smoke prints `MIRROR_BIN not set; skipping smoke`
 and exits 0.
 
+### Server-mode tests (opt-in package, needs `libssl-dev` + `openssl`)
+
+The server-mode package (`server-mode/`) continuously verifies the mTLS +
+discovery stack (test matrix T2–T15 of `plans/server-mode.md`). It needs
+OpenSSL dev headers to build (`apt install libssl-dev openssl` on Ubuntu);
+the baseline build does not.
+
+```bash
+cd server-mode
+lake build server-mode-test server-mode-test-discovery \
+         server-mode-test-consul server-mode-smoke
+.lake/build/bin/server-mode-test          # loopback TLS tests
+                                          #   (openssl s_server TLS peer, no apalache):
+                                          #   happy path, wrong CA, missing/invalid
+                                          #   client cert, hostname mismatch, TLS 1.2
+                                          #   peer, fingerprint pin, key-file mode,
+                                          #   EOF mid-session, pinned discovery
+.lake/build/bin/server-mode-test-discovery  # stub-registry tests (in-process
+                                            #   Std.Async.TCP server): valid /
+                                            #   malformed / non-200 / empty /
+                                            #   refused / timeout / chunked
+.lake/build/bin/server-mode-test-consul     # T14 real Consul; self-skips without
+                                            #   CONSUL_BIN (needs curl too)
+.lake/build/bin/server-mode-smoke           # T15 real E2E over mTLS; self-skips
+                                            #   without MIRROR_BIN
+```
+
+Every run generates a fresh ephemeral PKI via
+`server-mode/test/gen-test-certs.sh` into a temp directory — **no private
+keys are committed** (the script exists precisely so every run starts from
+a fresh, throwaway PKI; key files are written `0600`).
+
+The real E2E smoke starts an actual
+`ModelMirrors --server <port> --tls --cert … --key … --ca …` and runs all
+five flows over mTLS:
+
+```bash
+export PATH="$HOME/.elan/bin:$HOME/.local/bin/apalache/bin:$PATH"
+export MIRROR_BIN=/path/to/ModelMirrors
+cd server-mode && .lake/build/bin/server-mode-smoke
+# server-mode smoke (a) trace replay: PASS
+# server-mode smoke (b) generate+replay: PASS
+# server-mode smoke (c) validate: PASS
+# server-mode smoke (d) register_explore: PASS
+# server-mode smoke (e) explore-session walk: PASS
+# server-mode smoke: all checks passed (flows (a)-(e) over mTLS)
+```
+
+Without `MIRROR_BIN` (or `CONSUL_BIN`) the corresponding binary prints a
+skip message and exits 0; CI runs them in that mode (the stub registry
+covers T9–T12).
+
 ## Known issues
 
 ### apalache explorer: no constant initialization (`cinit`)

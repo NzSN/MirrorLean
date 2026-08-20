@@ -141,3 +141,31 @@ no native objects, so these build and run independently of the TLS shim.
 @[default_target]
 lean_exe "server-mode-test-discovery" where
   root := `Test.Discovery
+
+/- 
+## Phase 4: real E2E + real-Consul tests
+-/
+
+/--
+Real end-to-end smoke (T15): starts an actual
+`ModelMirrors --server --tls` from `MIRROR_BIN` with an ephemeral PKI and
+runs flows (a)-(e) over the mTLS channel. Self-skips (exit 0) when
+`MIRROR_BIN` is unset, exactly like the baseline `smoke` exe. Needs
+`apalache-mc` on PATH when `MIRROR_BIN` is set, and `openssl` for the PKI.
+-/
+lean_exe "server-mode-smoke" where
+  root := `Test.ServerModeSmoke
+  moreLinkObjs := #[`@/native_tls]
+  moreLinkArgs := #["-lssl", "-lcrypto"]
+
+/--
+Real-Consul test (T14, optional): starts a real Consul agent from
+`CONSUL_BIN`, registers a `modelmirrors` service whose `cert-sha256` pin
+matches an `openssl s_server` peer, and asserts `connectMirrorDiscovered`
+finds and connects to it. Self-skips (exit 0) when `CONSUL_BIN` is unset;
+CI uses the stub-registry tests instead.
+-/
+lean_exe "server-mode-test-consul" where
+  root := `Test.ServerModeConsul
+  moreLinkObjs := #[`@/native_tls]
+  moreLinkArgs := #["-lssl", "-lcrypto"]
