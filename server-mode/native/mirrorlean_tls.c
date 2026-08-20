@@ -34,6 +34,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -129,6 +130,36 @@ static int connect_socket(const char *host, uint16_t port,
   return fd;
 }
 
+/* --------------------- TLS handshake timeout --------------------------- */
+
+/*
+ * Set/clear SO_RCVTIMEO + SO_SNDTIMEO on a connected socket. Used to bound
+ * the TLS handshake so a dead or black-holed peer cannot block a caller
+ * forever; the timeouts are cleared immediately after a successful
+ * handshake so long-running sessions (e.g. an apalache check that takes a
+ * minute) are never cut off mid-session.
+ */
+static void set_socket_timeout(int fd, int ms) {
+  struct timeval tv;
+  tv.tv_sec = ms / 1000;
+  tv.tv_usec = (ms % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+/* Handshake timeout in ms: 10000 default, overridable via
+ * MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS (1..600000). */
+static int handshake_timeout_ms(void) {
+  const char *env = getenv("MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS");
+  if (env != NULL && *env != '\0') {
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end != NULL && *end == '\0' && v > 0 && v <= 600000)
+      return (int)v;
+  }
+  return 10000;
+}
+
 /* ------------------------- public C ABI -------------------------------- */
 
 mirrorlean_tls *mirrorlean_tls_connect(
@@ -203,6 +234,10 @@ mirrorlean_tls *mirrorlean_tls_connect(
   }
   SSL_set_fd(ssl, fd);
 
+  /* Bound the handshake (env-overridable ms); cleared after success so
+   * session traffic stays blocking. */
+  set_socket_timeout(fd, handshake_timeout_ms());
+
   /* SNI + hostname (SAN) verification. */
   if (server_name != NULL && *server_name != '\0') {
     if (SSL_set_tlsext_host_name(ssl, server_name) != 1) {
@@ -231,12 +266,21 @@ mirrorlean_tls *mirrorlean_tls_connect(
       snprintf(errbuf + used, errbuf_len - used, "; verification failed: %s",
                X509_verify_cert_error_string((int)vr));
     }
+    /* A socket-level timeout surfaces as SSL_ERROR_SYSCALL + EAGAIN. */
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      size_t used = strlen(errbuf);
+      snprintf(errbuf + used, errbuf_len - used,
+               "; handshake timed out (MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS=%d)",
+               handshake_timeout_ms());
+    }
     append_ssl_errors(errbuf, errbuf_len);
     SSL_free(ssl);
     close(fd);
     SSL_CTX_free(ctx);
     return NULL;
   }
+  /* Handshake done: restore blocking I/O for the session. */
+  set_socket_timeout(fd, 0);
 
   mirrorlean_tls *t = (mirrorlean_tls *)malloc(sizeof *t);
   if (t == NULL) {

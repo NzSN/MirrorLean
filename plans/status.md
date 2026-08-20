@@ -54,6 +54,42 @@ Recorded: 2026-08-18 (session, updated after t1). Authoritative design: docs/des
 - Final self-review vs design sections 5-9: public surface re-exported via MirrorLean.lean umbrella; wire tables 5.5 (14 client messages) and 5.6 (18 mirror messages) match the implementation; §6 transport, §7 spec closure, §8 client layer, §9 example all in place
 - Final clean build: rm -rf .lake/build && lake build && lake build test -> 115 tests, 0 failures; smoke rebuilt from clean -> (a)-(e) PASS; skip path exit 0
 
+## Server-mode (plans/server-mode.md) — phases 0–5, COMPLETE
+
+### Phase 0 — build spike (t1, engineer; commit 686c82e)
+- Separate top-level package `server-mode/` (Lake decision D2): Lake 5.0.0 TOML cannot declare native/C targets, so the plan's "optional root module" is not expressible; the documented fallback (separate package) is used.
+- `native/spike.c` + `Spike.lean` + custom `target native_spike` (compileO with system cc + `-I` Lean include dir, `-lssl -lcrypto`).
+- Baseline `lake build` stays byte-identical (no OpenSSL dependency); server mode is opt-in at build time (`cd server-mode && lake build`).
+- Structural finding (Phase 1): Lake 5 root-prefix module ownership means `MirrorLean.ServerMode`/`Discovery` (pure Lean) live in the ROOT package (compiled by `lake build`, never linked into baseline exes); this package holds the C shim + test/example exes.
+
+### Phase 1 — TLS transport (t2, engineer; commit 3aa48de)
+- `native/mirrorlean_tls.c/.h`: TLS 1.3-only client (min==max), CA + hostname/SAN verification (SSL_set1_host/SNI), 0600 key check, peer-cert SHA-256, best-effort close_notify; stable C ABI + Lean externs (`mirrorlean_tls_lean_*`).
+- `MirrorLean/ServerMode.lean`: `TlsClientConfig` (caFile/certFile/keyFile/serverName?/expectedCertSha256?), `connectMirrorTls` returning a normal `Transport`; expiry warning (< 7 days); `MIRRORLEAN_DEBUG_TLS[=_PLAIN]` debug logging (off by default).
+- `MirrorLean/Error.lean`: `MirrorError.tls`.
+- Gate: direct register replay works against real `ModelMirrors --server --tls`.
+
+### Phase 2 — Consul discovery (t3, discovery; commit 0223586)
+- `MirrorLean/ServerMode/Discovery.lean`: `parseRegistryUrl` (http only, rejects https/IPv6 literals in v1), minimal HTTP/1.1 GET over `Std.Async.TCP` (status/headers, Content-Length + read-to-EOF + chunked), fail-closed JSON decode → `ServiceInfo { host, port, certSha256 }`, distinct "registry unavailable" errors, `timeoutMs` parameter.
+- Gate: valid stub response → candidates; malformed/non-200/empty → `#[]`; tests green.
+
+### Phase 3 — pinned discovery (t4, engineer; commit 68ee784)
+- `connectMirrorDiscovered`: candidates in order with per-candidate `certSha256` pinning; failure closes and continues; empty/all-fail → clear aggregate error; direct `expectedCertSha256` pin for known hosts.
+- `server-mode/examples/ServerMode.lean` (env-driven: MIRROR_CA/CERT/KEY/HOST/PORT/CERT_SHA256, MODELMIRRORS_REGISTRY) + README/design transport rows.
+- Gate: stub registry bad-pin-then-good connects to the good candidate; direct pin mismatch closes before any JSON-lines traffic.
+
+### Phase 4 — tests + CI (t5, qa-docs)
+- `server-mode/test/gen-test-certs.sh`: ephemeral CA + server (SAN localhost/127.0.0.1) + client + second server (server2, different fingerprint) + unrelated CA (ca2) + ca2-signed client-bad cert; all keys 0600; **no private keys committed**. Certificates are X509v3 with serverAuth/clientAuth EKU — ModelMirrors' Haskell `tls` stack rejects X509v1 leaves ("LeafNotV3").
+- New non-default exes in `server-mode/lakefile.lean`: `server-mode-test` (loopback, 15 checks: happy path, wrong CA, missing/invalid client cert via `-verify_return_error`, hostname mismatch, TLS 1.2-only peer, fingerprint pin ok/mismatch, key-file 0644, EOF mid-session, idempotent close, pinned discovery bad-pin-then-good/empty/all-fail), `server-mode-test-discovery` (13 stub-registry tests), `server-mode-smoke` (MIRROR_BIN-gated real E2E over mTLS, flows (a)–(e)), `server-mode-test-consul` (CONSUL_BIN-gated real-Consul, T14).
+- `.github/workflows/ci.yml`: new `server-mode` job (installs libssl-dev+openssl, builds all server-mode exes, runs all four suites; real E2E + Consul self-skip); baseline job unchanged + explicit no-server-mode verification (`ldd` must show no libssl/libcrypto).
+- Verified locally: baseline 115 tests; loopback 15/15 ALL PASS; discovery 13/13; real E2E (a)–(e) PASS over mTLS twice.
+
+### Phase 5 — hardening + docs (t6, qa-docs)
+- Idempotent `Transport.close` (TLS handle freed once; extra closes are no-ops) + single-owner transport rule documented.
+- TLS handshake timeout: SO_RCVTIMEO/SO_SNDTIMEO during `SSL_connect` only (10 s default, `MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS` 1–600000), cleared after the handshake so long apalache sessions are unaffected; timeout failure reports "handshake timed out".
+- IPv6 verified (getaddrinfo AF_UNSPEC; `::1` loopback connect works). `https://` registry = documented follow-up (v1 plain HTTP; mTLS+pin remain the trust boundary).
+- Aggregate discovery error now names the registry URL; unused-variable linter warning removed.
+- README: server-mode quick start (build → gen certs → `--server --tls` → connect) + security notes (never commit keys, 0600, expiry, registry is location-only, one owner per transport); docs/design.md moved server mode out of the v1 deferred list and annotated the open question; plans updated.
+
 ## Environment facts
 - Lean 4.33.0 / Lake 5.0.0 via elan: export PATH="$HOME/.elan/bin:$PATH"
 - Mirror binary (GHC 9.14.1 build): /home/nzsn/Repos/ModelMirros/dist-newstyle/build/x86_64-linux/ghc-9.14.1/ModelMirrors-0.1.0.0/x/ModelMirrors/build/ModelMirrors/ModelMirrors

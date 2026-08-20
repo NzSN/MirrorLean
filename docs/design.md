@@ -33,11 +33,11 @@ oracle-mode surface of the protocol:
 ### Non-goals (v1)
 
 - The mirror side itself (ModelMirrors stays in Haskell).
-- mTLS/TLS 1.3 transports and Consul service discovery (both are transport-only
-  concerns; the session protocol is identical). Implemented as an opt-in
-  server-mode add-on (`MirrorLean.ServerMode` + the `server-mode/` package,
-  phases 1–3); excluded from the v1 *baseline* so the core library keeps zero
-  native dependencies.
+- mTLS/TLS 1.3 transports and Consul service discovery in the v1 *baseline*:
+  these are **shipped**, not deferred, as the opt-in server-mode add-on
+  (`MirrorLean.ServerMode` + the `server-mode/` package, phases 0–5 of
+  `plans/server-mode.md`) so the baseline core library keeps zero native
+  dependencies — see the transport section below.
 - TLA+ parsing beyond the `EXTENDS`/`INSTANCE` closure walk needed for inline
   spec sources.
 
@@ -391,7 +391,16 @@ inductive Target
   TLS 1.3 only, hostname/SAN verification, 0600 key check, peer-cert SHA-256)
   linked only into server-mode targets — the baseline keeps zero OpenSSL
   dependencies (the Lean 4.33 toolchain even bundles `libssl.a`/`libcrypto.a`,
-  so only the opt-in C shim needs system OpenSSL headers).
+  so only the opt-in C shim needs system OpenSSL headers). Hardening (Phase 5):
+  the TLS handshake is bounded by a 10 s socket timeout
+  (`MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS`, 1–600000; cleared after the
+  handshake so session traffic stays blocking); IPv6 hosts work through
+  `getaddrinfo`/`AF_UNSPEC`; `Transport.close` is **idempotent** (a second
+  close is a no-op — the native handle is freed once) and each transport is
+  single-owner (the `runClient*`/`ExploreSession` helpers close it exactly
+  once; sharing one transport across two sessions is unsupported);
+  `https://` registry URLs are a documented follow-up (v1 is plain HTTP,
+  and mTLS + pinning remain the trust boundary).
 - Frames must contain no raw newlines — guaranteed by `Lean.Json.compress`
   escaping. The reader must never split on embedded `
 `; lines are `
@@ -684,6 +693,8 @@ to the protocol state machine. Parked behind the core milestones.
 
 1. **Scope of v1:** include TCP now (lean stdlib `Std.Async.TCP`, no C deps), or
    stdio-only first with TCP in M3 as planned? Defer mTLS + Consul discovery?
+   → **Resolved:** TCP included (M3); mTLS + Consul discovery shipped as the
+   opt-in server-mode add-on (phases 0–5, `plans/server-mode.md`).
 2. **`runClientValidate`:** include it (protocol parity beyond the two reference
    clients), or keep strict sibling parity?
 3. **Error style:** `IO (Except MirrorError α)` (proposed) vs throwing exceptions

@@ -131,6 +131,8 @@ def connectMirrorTls (cfg : TlsClientConfig) (host : String) (port : UInt16) : I
   let debugTls ← ((· == some "1") <$> IO.getEnv "MIRRORLEAN_DEBUG_TLS")
   let debugPlain ← ((· == some "1") <$> IO.getEnv "MIRRORLEAN_DEBUG_TLS_PLAIN")
   let buf ← IO.mkRef (ByteArray.empty : ByteArray)
+  -- Owned by the Transport's `close`; set to 0 once freed (idempotent close).
+  let hRef ← IO.mkRef h
   let recvFn : IO (Option ByteArray) := do
     let (rerr, data) ← tlsRead h 4096
     if !rerr.isEmpty then
@@ -156,7 +158,15 @@ def connectMirrorTls (cfg : TlsClientConfig) (host : String) (port : UInt16) : I
           | none => IO.eprintln "mirrorlean TLS << EOF"
         pure line,
       close := do
-        tlsClose h
+        -- Idempotent: tlsClose frees the native handle, so a second
+        -- close is a no-op. A `Transport` is single-owner — the
+        -- runClient*/ExploreSession helpers close it exactly once;
+        -- extra closes are tolerated (stdio/TCP merely need harmless
+        -- double-shutdown; TLS would double-free).
+        let hcur ← hRef.get
+        unless hcur == 0 do
+          tlsClose hcur
+          hRef.set 0
         pure 0,
     }
   pure t
@@ -196,7 +206,7 @@ def connectMirrorDiscovered (cfg : TlsClientConfig) (registryUrl : String) : IO 
       s!"connectMirrorDiscovered: registry '{registryUrl}' returned no candidates")
   let acc ← candidates.foldlM (init := (Sum.inl #[] : Sum (Array String) Transport)) fun acc c => do
     match acc with
-    | .inr t => pure acc
+    | .inr _ => pure acc
     | .inl errs =>
         let ccfg : TlsClientConfig := { cfg with expectedCertSha256 := c.certSha256 }
         try
@@ -208,6 +218,6 @@ def connectMirrorDiscovered (cfg : TlsClientConfig) (registryUrl : String) : IO 
   | .inr t => pure t
   | .inl errs =>
       throw (IO.userError
-        s!"connectMirrorDiscovered: all {candidates.size} candidate(s) failed:\n{String.intercalate "\n" errs.toList}")
+        s!"connectMirrorDiscovered: all {candidates.size} candidate(s) from registry '{registryUrl}' failed:\n{String.intercalate "\n" errs.toList}")
 
 end MirrorLean.ServerMode

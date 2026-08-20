@@ -264,7 +264,11 @@ Key points: TLS 1.3 only; the server is verified against the CA and the
 hostname/SAN; the client presents `certFile`/`keyFile` (key must be mode
 `0600` on POSIX); a `cert-sha256` fingerprint is checked after the handshake
 and closes the connection on mismatch (registry pinning is fail-closed);
-client-certificate expiry (< 7 days) warns on stderr; debug logging behind
+client-certificate expiry (< 7 days) warns on stderr; the TLS handshake is
+bounded by a 10 s timeout (override with
+`MIRRORLEAN_TLS_HANDSHAKE_TIMEOUT_MS`, 1–600000 — the timeout is removed
+after the handshake so long apalache sessions are unaffected); IPv6 hosts
+are supported (getaddrinfo `AF_UNSPEC`); debug logging behind
 `MIRRORLEAN_DEBUG_TLS=1` (`_PLAIN=1` for full plaintext).
 
 This is an opt-in build: baseline targets need no OpenSSL. Build the
@@ -272,6 +276,63 @@ server-mode targets from `server-mode/` (`lake build server-mode-test`,
 `server-mode-example`) or see `server-mode/examples/ServerMode.lean` for the
 env-driven example (`MIRROR_CA`, `MIRROR_CERT`, `MIRROR_KEY`, `MIRROR_HOST`,
 `MIRROR_PORT`, `MODELMIRRORS_REGISTRY`, `MIRROR_CERT_SHA256`).
+
+#### Server-mode quick start
+
+1. **Build the opt-in package** (needs `libssl-dev` + `openssl`):
+
+   ```bash
+   cd server-mode && lake build server-mode-example
+   ```
+
+2. **Generate a PKI.** For a quick test, `server-mode/test/gen-test-certs.sh`
+   generates a throwaway CA + server + client PKI into a temp dir (test-only;
+   for real use run your own CA — never commit private keys):
+
+   ```bash
+   server-mode/test/gen-test-certs.sh "$(mktemp -d)"   # prints the dir
+   ```
+
+3. **Start the mirror** (apalache-mc must be on PATH):
+
+   ```bash
+   ModelMirrors --server 8443 --tls        --cert server.crt --key server.key --ca ca.crt
+   ```
+
+4. **Connect** with the env-driven example:
+
+   ```bash
+   MIRROR_CA=ca.crt MIRROR_CERT=client.crt MIRROR_KEY=client.key    MIRROR_HOST=127.0.0.1 MIRROR_PORT=8443    server-mode/.lake/build/bin/server-mode-example
+   # all traces replayed over mTLS: implementation matches the model
+   ```
+
+   Or drive any `runClient*` flow directly with
+   `(.transport (← ServerMode.connectMirrorTls cfg host port))` as shown
+   above. With `MODELMIRRORS_REGISTRY=http://consul:8500` set, the example
+   discovers candidates and connects with per-candidate `cert-sha256`
+   pinning instead of a direct connect.
+
+#### Security notes (server mode)
+
+* **Never commit private keys.** `server-mode/test/gen-test-certs.sh` writes
+  into a caller-chosen directory with mode `0600` and is intended for tests
+  only; the test suite regenerates a fresh PKI per run into a temp dir.
+* **Key file permissions:** on POSIX the client key must not be readable by
+  group/other (`0600`); the shim refuses to connect otherwise.
+* **Certificates expire:** the client warns on stderr when its certificate
+  is expired or expires within 7 days. ModelMirrors refuses to start with
+  an expiring server certificate.
+* **The registry is a location hint, not a trust boundary.** `discoverMirrors`
+  is plain HTTP and fail-closed (`#[]` on malformed data); the trust comes
+  from mTLS + `cert-sha256` pinning after the handshake. A compromised
+  registry can only cause denial of service, never authentication bypass.
+  `https://` registry URLs are **not** supported in v1 (documented
+  follow-up); use an HTTP-reachable Consul (or a pinned direct connect).
+* **One owner per transport.** Each `Transport` from `connectMirrorTls` /
+  `connectMirrorDiscovered` is owned by a single session — the
+  `runClient*`/`ExploreSession` helpers close it exactly once on every exit
+  path. Extra closes are tolerated (close is idempotent), but sharing one
+  transport across two sessions will fail (the first session closes it).
 
 ### `ApalacheConfig`
 

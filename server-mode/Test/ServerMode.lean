@@ -190,26 +190,39 @@ def cleanupServer (c : IO.Process.Child (IO.Process.StdioConfig.mk IO.Process.St
   try _ ← c.wait catch _ => pure ()
   pure ()
 
-/-- Wait until a TCP listener is bound on 127.0.0.1:`port` (server
-startup race; up to ~5 s).
+/-- Give the freshly spawned server a grace period before the test
+connects (the `retryConnect`/`expectFailure` helpers absorb any residual
+startup lag).
 
-Probes with a **bind** attempt, not a connect: a connect would be accepted
-by `s_server -naccept 1` and consume the test's single connection. -/
+This is deliberately **not** a bind/connect probe: Lean 4.33's
+`Std.Async.TCP.Socket.Server` has no `close` (the fd is released only at
+GC), so a bind-probe socket can outlive its scope and the real server then
+dies with EADDRINUSE; and a connect probe would be accepted by
+`s_server -naccept 1` and consume the test's single connection. -/
 def waitReady (port : UInt16) : IO Unit := do
-  let mut n := 0
-  let mut up := false
-  while !up && n < 50 do
-    let bindOk ← try
-      let s ← Std.Async.TCP.Socket.Server.mk
-      s.bind (Std.Net.SocketAddress.v4 { addr := Std.Net.IPv4Addr.ofParts 127 0 0 1, port := port })
-      pure true
-    catch _ => pure false
-    if bindOk then do
-      IO.sleep 100
-      n := n + 1
-    else
-      up := true
-  pure ()
+  IO.sleep 400
+
+/-- Retry `connectMirrorDiscovered` while the freshly spawned s_server
+peers are still coming up (the grace-period waitReady above is approximate;
+a startup-lag error surfaces as a "cannot connect" per-candidate failure).
+
+`mkStub` is called **per attempt**: the in-process stub registry serves
+exactly one `discoverMirrors` request (single accept, then close), so a
+retry must spin up a fresh stub instead of reusing a consumed one. -/
+partial def retryDiscovered (cfg : ServerMode.TlsClientConfig) (mkStub : IO (UInt16 × Task (Except IO.Error Unit))) (attempts : Nat) : IO Transport := do
+  let (regPort, _) ← mkStub
+  try
+    ServerMode.connectMirrorDiscovered cfg s!"http://127.0.0.1:{regPort}"
+  catch e =>
+    -- Only a genuine startup-lag failure ("cannot connect" to a candidate)
+    -- is worth retrying: any other error (e.g. the expected fingerprint
+    -- mismatch, or an invalid registry response) must surface as-is, and
+    -- retrying would consume the s_server's single `-naccept 1` accept.
+    let msg := toString e
+    if attempts == 0 || !msg.contains "cannot connect" then throw e
+    else do
+      IO.sleep 200
+      retryDiscovered cfg mkStub (attempts - 1)
 
 /--
 Gate: a stub registry listing a bad fingerprint first and a good candidate
@@ -228,11 +241,10 @@ def testDiscovered (dir : String) : IO Bool := do
     let childB ← spawnServerWith portB "server2" dir "-tls1_3"
     waitReady portB
     let body := stubRegistryBody "127.0.0.1" portA portB fpB
-    let (regPort, _) ← startStubRegistry (httpJson body)
     let cfg : ServerMode.TlsClientConfig :=
       { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
     try
-      let t ← ServerMode.connectMirrorDiscovered cfg s!"http://127.0.0.1:{regPort}"
+      let t ← retryDiscovered cfg (startStubRegistry (httpJson body)) 15
       t.send "abccba"
       let line ← t.recv
       let _ ← t.close
@@ -246,11 +258,10 @@ def testDiscovered (dir : String) : IO Bool := do
       cleanupServer childB)
   -- (b) empty registry -> clear error.
   ok := ok && (← do
-    let (regPort, _) ← startStubRegistry (httpJson "[]")
     let cfg : ServerMode.TlsClientConfig :=
       { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
     try
-      let _ ← ServerMode.connectMirrorDiscovered cfg s!"http://127.0.0.1:{regPort}"
+      let _ ← retryDiscovered cfg (startStubRegistry (httpJson "[]")) 1
       IO.println "FAIL  discovered: empty registry unexpectedly connected"
       pure false
     catch e =>
@@ -269,16 +280,15 @@ def testDiscovered (dir : String) : IO Bool := do
     let childA ← spawnServerWith portA "server" dir "-tls1_3"
     waitReady portA
     let body := "[" ++ consulEntry "127.0.0.1" portA (some "0000000000000000000000000000000000000000000000000000000000000000") ++ "]"
-    let (regPort, _) ← startStubRegistry (httpJson body)
     let cfg : ServerMode.TlsClientConfig :=
       { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
     try
-      let _ ← ServerMode.connectMirrorDiscovered cfg s!"http://127.0.0.1:{regPort}"
+      let _ ← retryDiscovered cfg (startStubRegistry (httpJson body)) 15
       IO.println "FAIL  discovered: all-fail registry unexpectedly connected"
       pure false
     catch e =>
       let msg := toString e
-      if msg.contains "all 1 candidate(s) failed" && msg.contains "fingerprint mismatch" then do
+      if msg.contains "all 1 candidate(s) from registry" && msg.contains "fingerprint mismatch" then do
         IO.println "PASS  discovered: all candidates failing raises aggregated error"
         pure true
       else do
@@ -455,6 +465,18 @@ def main : IO UInt32 := do
       res := false
     cleanupServer child
     pure res)
+
+  -- 11. (hardening) idempotent close: closing a TLS transport twice must
+  -- be a no-op (the native handle is freed once; a double free would crash).
+  ok := ok && (← withServer dir fun port => do
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
+    let t ← retryConnect cfg "127.0.0.1" port 20
+    let _ ← t.close
+    let _ ← t.close
+    let _ ← t.close
+    IO.println "PASS  idempotent close: repeated close is a no-op"
+    pure true)
 
   -- Phase 3: pinned discovery.
   ok := ok && (← testDiscovered dir)

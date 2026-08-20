@@ -42,6 +42,27 @@ Recorded: 2026-08-18. See plans/status.md for what is done; docs/design.md is th
 - Final self-review vs design sections 5-9 (public names exported via MirrorLean.lean umbrella, wire tables 5.5/5.6 match) — DONE
 - Clean build: export PATH="$HOME/.elan/bin:$PATH"; rm -rf .lake/build && lake build && lake build test && .lake/build/bin/test -> 115 tests, 0 failures; smoke rebuilt and (a)-(e) PASS against the real mirror
 
-## Project status: COMPLETE — all jobs J1-J5 done; see plans/status.md
+## Server-mode: phases 0–5 COMPLETE (see plans/status.md)
+
+All six server-mode plan phases (0–5) are done and verified: separate
+`server-mode/` package (C shim + exes), TLS 1.3 mTLS transport
+(`connectMirrorTls`), Consul discovery (`discoverMirrors`, fail-closed),
+pinned discovery (`connectMirrorDiscovered`), full test matrix T1–T15
+(loopback 15 checks, stub-registry 13 tests, real E2E flows (a)–(e) over
+mTLS, CONSUL_BIN-gated real Consul, MIRROR_BIN-gated smoke), and a CI
+`server-mode` job with the baseline job explicitly exercising the
+no-server-mode build.
+
+### Follow-ups (deliberately out of v1, documented in README/design)
+- `https://` registry URLs (v1 is plain HTTP; mTLS + cert-sha256 pinning
+  remain the trust boundary — a registry can only cause DoS, never bypass).
+- IPv6 literal parsing in `parseRegistryUrl` (`[::1]:8500` is rejected;
+  the TLS connect itself supports IPv6 hosts via getaddrinfo AF_UNSPEC).
+- macOS/Homebrew OpenSSL build validation (CI pins Ubuntu OpenSSL 3;
+  Linux-first per plan §10).
+- Running the CONSUL_BIN-gated T14 test in CI with a real Consul agent
+  (CI currently uses the stub registry by design).
+
+## Project status: COMPLETE — all jobs J1-J5 done; server-mode phases 0–5 done; see plans/status.md
 
 
