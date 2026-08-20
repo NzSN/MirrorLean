@@ -8,6 +8,10 @@ build/
 *.c
 *.o
 
+# ...but tracked native sources under server-mode/ are committed
+!server-mode/native/*.c
+!server-mode/native/*.h
+
 # Lean package manager
 leanpkg.path
 
