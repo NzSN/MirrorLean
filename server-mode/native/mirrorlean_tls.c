@@ -24,6 +24,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@
 #include <string.h>
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -238,17 +240,27 @@ mirrorlean_tls *mirrorlean_tls_connect(
    * session traffic stays blocking. */
   set_socket_timeout(fd, handshake_timeout_ms());
 
-  /* SNI + hostname (SAN) verification. */
+  /* SAN-only server identity verification. DNS names use SNI and a DNS SAN;
+   * IP literals omit SNI and require an IP SAN. Legacy CN fallback is never
+   * accepted. */
   if (server_name != NULL && *server_name != '\0') {
-    if (SSL_set_tlsext_host_name(ssl, server_name) != 1) {
-      set_err(errbuf, errbuf_len, "cannot set SNI server name '%s'", server_name);
-      SSL_free(ssl);
-      close(fd);
-      SSL_CTX_free(ctx);
-      return NULL;
+    struct in_addr a4;
+    struct in6_addr a6;
+    int is_ip = inet_pton(AF_INET, server_name, &a4) == 1 ||
+                inet_pton(AF_INET6, server_name, &a6) == 1;
+    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+    int identity_ok;
+    if (is_ip) {
+      identity_ok = X509_VERIFY_PARAM_set1_ip_asc(param, server_name);
+    } else {
+      X509_VERIFY_PARAM_set_hostflags(
+          param, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+      identity_ok = SSL_set_tlsext_host_name(ssl, server_name) == 1 &&
+                    SSL_set1_host(ssl, server_name) == 1;
     }
-    if (SSL_set1_host(ssl, server_name) != 1) {
-      set_err(errbuf, errbuf_len, "cannot set hostname verification for '%s'", server_name);
+    if (identity_ok != 1) {
+      set_err(errbuf, errbuf_len,
+              "cannot set SAN identity verification for '%s'", server_name);
       SSL_free(ssl);
       close(fd);
       SSL_CTX_free(ctx);

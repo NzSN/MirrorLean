@@ -40,6 +40,18 @@ structure Transport where
   recv  : IO (Option String)
   close : IO UInt32
 
+/-- Maximum UTF-8 payload size before the terminating LF is appended. -/
+def maxProtocolLineBytes : Nat := 65535
+
+/-- Enforce the protocol's outbound framing invariants before any write. -/
+def validateProtocolLine (line : String) : IO Unit := do
+  if line.isEmpty then
+    throw (IO.userError "protocol line must not be empty")
+  if line.contains '\n' then
+    throw (IO.userError "protocol line contains an embedded newline")
+  if line.toUTF8.size > maxProtocolLineBytes then
+    throw (IO.userError "protocol line exceeds 65535-byte UTF-8 payload limit")
+
 /--
 The concrete child type used by `spawnMirror`: stdin and stdout are piped (so the
 client can talk to the mirror), stderr is inherited (so the mirror's error output
@@ -66,6 +78,7 @@ def Transport.ofChild (child : StdioPipedChild) : Transport :=
   let stdout : IO.FS.Handle := child.stdout
   {
     send := fun line => do
+      validateProtocolLine line
       IO.FS.Handle.putStrLn stdin line
       IO.FS.Handle.flush stdin,
     recv := do
@@ -168,6 +181,7 @@ def connectMirror (host : String) (port : UInt16) : IO Transport := do
   let t : Transport :=
     {
       send := fun line => do
+        validateProtocolLine line
         Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client ((line ++ "\n").toUTF8))
         pure (),
       recv := recvLine recvFn buf,

@@ -29,6 +29,16 @@ openssl x509 -req -in "$OUT/server.csr" \
   -out "$OUT/server.crt" -days 2 \
   -extfile <(printf '%b\n' "$SERVEREXT") >/dev/null 2>&1
 
+# --- CN-only server certificate (negative SAN-identity test) -------------
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$OUT/server-cn.key" -out "$OUT/server-cn.csr" \
+  -subj "/CN=localhost" >/dev/null 2>&1
+CNEXT="basicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth"
+openssl x509 -req -in "$OUT/server-cn.csr" \
+  -CA "$OUT/ca.crt" -CAkey "$OUT/ca.key" -CAcreateserial \
+  -out "$OUT/server-cn.crt" -days 2 \
+  -extfile <(printf '%b\n' "$CNEXT") >/dev/null 2>&1
+
 # --- client certificate --------------------------------------------------
 # X509v3 with clientAuth EKU: ModelMirrors' server (Haskell `tls` package)
 # rejects X509v1 leaves ("certificate rejected: [LeafNotV3]").
@@ -70,6 +80,6 @@ openssl x509 -req -in "$OUT/client-bad.csr" \
   -out "$OUT/client-bad.crt" -days 2 \
   -extfile <(printf '%b\n' "$CLIENTEXT") >/dev/null 2>&1
 
-chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/server2.key" "$OUT/client.key" "$OUT/ca2.key" "$OUT/client-bad.key"
+chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/server-cn.key" "$OUT/server2.key" "$OUT/client.key" "$OUT/ca2.key" "$OUT/client-bad.key"
 rm -f "$OUT"/*.csr "$OUT/ca.srl" "$OUT/ca2.srl"
 echo "$OUT"

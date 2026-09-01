@@ -257,6 +257,7 @@ alternation; the explorer state lives in the mirror. -/
 structure ExploreSession where
   transport : Transport
   ready : ExploreReady
+  closed : IO.Ref Bool
 
 namespace ExploreSession
 
@@ -266,25 +267,42 @@ the public name; startExploreSession is the alias.) -/
 def start (t : Target) (spec : ApalacheSpec) (invariants exports : Array String)
     : IO (Except MirrorError ExploreSession) := do
   let tr ← resolveTarget t
-  tr.send (ClientMessage.encode (.registerExploreSession spec invariants exports))
-  match ← recvMsg tr with
-  | .error e => closeErr tr e
-  | .ok msg => match msg with
-      | .explorerReady ni nn nv => pure (.ok { transport := tr, ready := { initTransitions := ni, nextTransitions := nn, stateInvariants := nv } })
-      | .protocolError d        => closeErr tr (.protocol d)
-      | .registerError d        => closeErr tr (.registerFailed d)
-      | other                   => closeErr tr (.unexpectedMessage (stepName other))
+  try
+    tr.send (ClientMessage.encode (.registerExploreSession spec invariants exports))
+    match ← recvMsg tr with
+    | .error e => closeErr tr e
+    | .ok msg => match msg with
+        | .explorerReady ni nn nv => do
+            let closed ← IO.mkRef false
+            pure (.ok { transport := tr, closed, ready :=
+              { initTransitions := ni, nextTransitions := nn, stateInvariants := nv } })
+        | .protocolError d        => closeErr tr (.protocol d)
+        | .registerError d        => closeErr tr (.registerFailed d)
+        | other                   => closeErr tr (.unexpectedMessage (stepName other))
+  catch e =>
+    closeErr tr (.io e)
 
-/-- Send one command and receive its reply. A protocol_error reply becomes
-MirrorError.protocol but the session STAYS OPEN (protocol spec: a rejected
-command does not close the session), so callers may retry. -/
+/-- Close and poison a session, returning the supplied error. -/
+private def poison {α : Type} (s : ExploreSession) (e : MirrorError)
+    : IO (Except MirrorError α) := do
+  s.closed.set true
+  let _ ← s.transport.close
+  pure (.error e)
+
+/-- Send one command and receive its reply. Transport errors, malformed input,
+and protocol_error close and poison the persistent session. -/
 private def cmd (s : ExploreSession) (m : ClientMessage)
     : IO (Except MirrorError MirrorMessage) := do
-  s.transport.send (ClientMessage.encode m)
-  match ← recvMsg s.transport with
-  | .error e => pure (.error e)
-  | .ok (.protocolError d) => pure (.error (.protocol d))
-  | .ok msg => pure (.ok msg)
+  if ← s.closed.get then
+    pure (.error .transportClosed)
+  else try
+    s.transport.send (ClientMessage.encode m)
+    match ← recvMsg s.transport with
+    | .error e => poison s e
+    | .ok (.protocolError d) => poison s (.protocol d)
+    | .ok msg => pure (.ok msg)
+  catch e =>
+    poison s (.io e)
 
 /-- Require a specific reply, mapping anything else to unexpectedMessage. -/
 private def expect (s : ExploreSession) (m : ClientMessage)
@@ -293,7 +311,7 @@ private def expect (s : ExploreSession) (m : ClientMessage)
   | .error e => pure (.error e)
   | .ok msg => match f msg with
       | some a => pure (.ok a)
-      | none   => pure (.error (.unexpectedMessage (stepName msg)))
+      | none   => poison s (.unexpectedMessage (stepName msg))
 
 /-- Assume an init/next transition by id; the explorer returns its status
 and records a snapshot. -/
@@ -340,8 +358,11 @@ def done (s : ExploreSession) : IO (Except MirrorError Unit) := do
   match ← cmd s .exploreDone with
   | .error e => pure (.error e)
   | .ok msg => match msg with
-      | .exploreSessionDone => do let _ ← s.transport.close; pure (.ok ())
-      | other => pure (.error (.unexpectedMessage (stepName other)))
+      | .exploreSessionDone => do
+          s.closed.set true
+          let _ ← s.transport.close
+          pure (.ok ())
+      | other => poison s (.unexpectedMessage (stepName other))
 
 end ExploreSession
 

@@ -579,6 +579,7 @@ structure ExploreReady where
 structure ExploreSession where
   transport : Transport
   ready     : ExploreReady
+  closed    : IO.Ref Bool
 
 namespace ExploreSession
   def open (t : Target) (spec : ApalacheSpec) (invariants exports : Array String)
@@ -595,10 +596,9 @@ end ExploreSession
 
 - `open` sends `register_explore_session`, requires `explorer_ready`;
   `register_error`/`protocol_error` close and fail.
-- Every command is strict request/reply. A `protocol_error` reply returns
-  `MirrorError.protocol` but the **session stays open** (protocol spec: the
-  session survives a rejected command) — callers can retry with a corrected
-  argument, matching TS behavior where `cmd` throws but the object remains usable.
+- Every command is strict request/reply. A `protocol_error`, malformed reply,
+  or impossible reply closes and poisons the session. The failing call returns
+  its error; later calls return `transportClosed`.
 - `done` requires `explore_session_done`, then closes the transport.
 
 ---
@@ -702,4 +702,3 @@ to the protocol state machine. Parked behind the core milestones.
 4. **License:** ISC to match MirrorECMA/MirrorRust (ModelMirrors itself is AGPL-3.0;
    a client that merely talks the protocol need not inherit it — recommend ISC).
 5. **Lean version pin:** `v4.33.0` (current installed here); acceptable?
-

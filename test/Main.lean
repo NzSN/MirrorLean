@@ -366,6 +366,26 @@ def testTransportEof : IO Bool := do
   let d ← checkEq "transport eof close code" (toString code) "0"
   pure (a && b && c && d)
 
+def protocolLineAccepted (line : String) : IO Bool := do
+  try
+    validateProtocolLine line
+    pure true
+  catch _ =>
+    pure false
+
+def testProtocolLineValidation : IO Bool := do
+  let asciiMax := String.ofList (List.replicate 65535 'x')
+  let asciiTooLarge := String.ofList (List.replicate 65536 'x')
+  let utf8Max := String.ofList (List.replicate 32767 'é') ++ "a"
+  let utf8TooLarge := String.ofList (List.replicate 32768 'é')
+  let a ← check "framing: 65535 ASCII bytes accepted" (← protocolLineAccepted asciiMax)
+  let b ← check "framing: 65536 ASCII bytes rejected" !(← protocolLineAccepted asciiTooLarge)
+  let c ← check "framing: UTF-8 byte boundary accepted" (← protocolLineAccepted utf8Max)
+  let d ← check "framing: UTF-8 byte overflow rejected" !(← protocolLineAccepted utf8TooLarge)
+  let e ← check "framing: empty line rejected" !(← protocolLineAccepted "")
+  let f ← check "framing: embedded newline rejected" !(← protocolLineAccepted "bad\nline")
+  pure (a && b && c && d && e && f)
+
 -- --------------------------------------------------------------------------
 -- 9. Client (M2): drive the replay main loop over a pure in-memory transport.
 -- --------------------------------------------------------------------------
@@ -385,6 +405,47 @@ def fakeTransport (sent inbox : IO.Ref (Array String)) : Transport :=
         pure (some line),
     close := pure 0,
   }
+
+/-- Fake transport that counts closes, for persistent-session poison tests. -/
+def trackedFakeTransport (sent inbox : IO.Ref (Array String)) (closes : IO.Ref Nat) : Transport :=
+  {
+    send := fun line => sent.modify (·.push line),
+    recv := do
+      let arr ← inbox.get
+      if arr.isEmpty then pure none
+      else
+        inbox.set (arr.drop 1)
+        pure (some (arr.getD 0 "")),
+    close := do
+      closes.modify (· + 1)
+      pure 0,
+  }
+
+def testExploreProtocolErrorPoisons : IO Bool := do
+  let inbox ← IO.mkRef #[
+    "{\"proto_step\":\"explorer_ready\",\"initTransitions\":1,\"nextTransitions\":0,\"stateInvariants\":0}",
+    "{\"proto_step\":\"protocol_error\",\"error\":\"bad transition\"}"
+  ]
+  let sent ← IO.mkRef (#[] : Array String)
+  let closes ← IO.mkRef 0
+  let opened ← startExploreSession
+    (.transport (trackedFakeTransport sent inbox closes)) sampleSpec #[] #[]
+  match opened with
+  | .error _ => check "explore poison: session opened" false
+  | .ok session =>
+      let first ← ExploreSession.assumeTransition session 99
+      let second ← ExploreSession.queryState session
+      let sentLines ← sent.get
+      let closeCount ← closes.get
+      let a ← check "explore poison: protocol_error surfaced" (match first with
+        | .error (.protocol "bad transition") => true
+        | _ => false)
+      let b ← check "explore poison: later command reports closed" (match second with
+        | .error .transportClosed => true
+        | _ => false)
+      let c ← check "explore poison: no command written after poison" (sentLines.size == 2)
+      let d ← check "explore poison: transport closed once" (closeCount == 1)
+      pure (a && b && c && d)
 
 def testClientHappy : IO Bool := do
   let inbox ← IO.mkRef #[
@@ -528,6 +589,7 @@ def testClient : List (String × IO Bool) :=
     ("client validate specInvalid", testClientValidateSpecInvalid),
     ("client validate registerFailed", testClientValidateRegisterFailed),
     ("client validate valid", testClientValidateValid),
+    ("explorer protocol_error poisons", testExploreProtocolErrorPoisons),
   ]
 
 -- --------------------------------------------------------------------------
@@ -599,6 +661,18 @@ INSTANCE DepA WITH x <- 1, y <- 2
       let d ← check "spec inst comma: DepB third" (srcHasModule spec 2 "DepB")
       pure (a && b && c && d)
 
+def testSpecAdvancedForms : IO Bool := do
+  let r ← specFromFile (System.FilePath.mk "test/fixtures/root/Advanced.tla")
+  match r with
+  | .error _ => check "spec advanced forms: error" false
+  | .ok spec =>
+      let a ← checkEq "spec advanced: 4 sources" (toString spec.sources.size) "4"
+      let b ← check "spec advanced: root first" (srcHasModule spec 0 "Advanced")
+      let c ← check "spec advanced: multiline EXTENDS" (srcHasModule spec 1 "DepA")
+      let d ← check "spec advanced: second EXTENDS module" (srcHasModule spec 2 "DepB")
+      let e ← check "spec advanced: expression INSTANCE" (srcHasModule spec 3 "DepC")
+      pure (a && b && c && d && e)
+
 def testSpecLibDir : IO Bool := do
   let r ← specFromFiles (System.FilePath.mk "test/fixtures/root/UsesExtra.tla")
       #[System.FilePath.mk "test/fixtures/libdir"]
@@ -657,6 +731,7 @@ def testSpecClosure : List (String × IO Bool) :=
     ("spec builtin-only", testSpecBuiltinOnly),
     ("spec INSTANCE WITH", testSpecWithInst),
     ("spec INSTANCE WITH comma", testSpecWithInstComma),
+    ("spec continued and embedded forms", testSpecAdvancedForms),
     ("spec searchDirs lookup", testSpecLibDir),
     ("spec TLA_LIBRARY_PATH lookup", testSpecTlaLibraryPath),
     ("spec ambiguity error", testSpecAmbiguity),
@@ -715,6 +790,7 @@ def testTransport : List (String × IO Bool) :=
   [
     ("transport round-trip", testTransportRoundTrip),
     ("transport eof empty-line", testTransportEof),
+    ("transport protocol line validation", testProtocolLineValidation),
   ]
 
 def allTests : List (String × IO Bool) :=
@@ -741,4 +817,3 @@ end MirrorLeanTest
 
 /-- Executable entry point: run the M1 unit tests. -/
 def main : IO Unit := MirrorLeanTest.main
-

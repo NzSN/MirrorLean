@@ -72,12 +72,16 @@ def counterComputer : IO StateComputer := do
         , ("parameters", .record #[("stride", .int stride)])
         , ("action_taken", .str "tick") ]
 
-def counterCfg : ApalacheConfig :=
-  { specPath := "specs/Counter.tla", invariant := "TraceComplete",
-    lengthBound := 6, constInit := some "CInit", paramVars := some "parameters" }
+/-- Counter replay configuration. `SPEC` selects an authoritative model outside
+the client repository; the checked-in fixture remains the portable default. -/
+def counterCfg : IO ApalacheConfig := do
+  let selectedSpec := (← IO.getEnv "SPEC").getD "specs/Counter.tla"
+  pure { specPath := selectedSpec, invariant := "TraceComplete",
+         lengthBound := 6, constInit := some "CInit", paramVars := some "parameters" }
 
 /-- (a) replay the checked-in violation trace through the mirror. -/
 def replayTrace (bin : String) : IO (Except MirrorError Unit) := do
+  let cfg ← counterCfg
   let traceText ← IO.FS.readFile (System.FilePath.mk "specs/traces/violation.itf.json")
   match parseItfStates traceText with
   | .error e => pure (.error (.json e))
@@ -85,13 +89,13 @@ def replayTrace (bin : String) : IO (Except MirrorError Unit) := do
       let compute ← presetClient states
       runClientWithTraces
         (.binary (System.FilePath.mk bin))
-        counterCfg
+        cfg
         #[System.FilePath.mk "specs/traces/violation.itf.json"]
         compute
 
 /-- (b) generate fresh counterexample traces and replay them. -/
 def generateAndReplay (bin : String) : IO (Except MirrorError Unit) := do
-  runClient (.binary (System.FilePath.mk bin)) counterCfg
+  runClient (.binary (System.FilePath.mk bin)) (← counterCfg)
     { numTraces := 10, view := some "View" } (← counterComputer)
 
 /-- (c) validate-only session: a valid config reports ok; an invariant
@@ -100,13 +104,14 @@ the mirror reports as register_error (MirrorError.registerFailed). A genuine
 spec defect (type error or violated invariant) is the specInvalid path; see
 the fake-transport unit tests in test/Main.lean. -/
 def validateCases (bin : String) : IO (Except MirrorError Unit) := do
-  match ← runClientValidate (.binary (System.FilePath.mk bin)) counterCfg 3 with
+  let cfg ← counterCfg
+  match ← runClientValidate (.binary (System.FilePath.mk bin)) cfg 3 with
   | .error e =>
       pure (.error e)
   | .ok () =>
       -- an invariant that does not exist in the spec => apalache config
       -- error (exit 255) => register_error on the wire => registerFailed
-      let badCfg : ApalacheConfig := { counterCfg with invariant := "NoSuchInvariant" }
+      let badCfg : ApalacheConfig := { cfg with invariant := "NoSuchInvariant" }
       match ← runClientValidate (.binary (System.FilePath.mk bin)) badCfg 3 with
       | .ok ()        => pure (.error (.unexpectedMessage "validate expected registerFailed"))
       | .error (.registerFailed _) => pure (.ok ())

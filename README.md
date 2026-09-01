@@ -200,9 +200,10 @@ ExploreSession.rollback s 0              -- → snapshot id
 ExploreSession.done s                    -- ends the session and closes the mirror
 ```
 
-Commands and replies strictly alternate. A rejected command returns
-`MirrorError.protocol` but the **session stays open** — you may keep issuing
-commands. `invariantId` indexes into the `invariants` list passed at open.
+Commands and replies strictly alternate. A `protocol_error`, malformed reply,
+or impossible reply closes and poisons the session; the failing call returns
+the corresponding `MirrorError`, and later calls return `transportClosed`.
+`invariantId` indexes into the `invariants` list passed at open.
 
 **Naming note:** the design called this `ExploreSession.open`, but `open`
 is a Lean keyword; the public name is `ExploreSession.start`, with
@@ -229,7 +230,7 @@ wrong file would otherwise be shipped silently). The result is
 All entry points accept a `Target` — a binary path (spawns the mirror over
 stdio) or a `Transport`. `connectMirror` provides a TCP transport; run the
 mirror as a daemon with `--serve <port>` (one protocol session per
-connection, sequential accept loop):
+connection, bounded concurrent worker pool):
 
 ```lean
 -- mirror side:  ModelMirrors --serve 8823
@@ -260,8 +261,9 @@ let t : Target := .transport (← ServerMode.connectMirrorTls cfg "mirror.exampl
 let t : Target := .transport (← ServerMode.connectMirrorDiscovered cfg "http://consul:8500")
 ```
 
-Key points: TLS 1.3 only; the server is verified against the CA and the
-hostname/SAN; the client presents `certFile`/`keyFile` (key must be mode
+Key points: TLS 1.3 only; the server is verified against the CA and SAN only
+(CN fallback is disabled; IP literals require IP SAN and omit SNI); the client
+presents `certFile`/`keyFile` (key must be mode
 `0600` on POSIX); a `cert-sha256` fingerprint is checked after the handshake
 and closes the connection on mismatch (registry pinning is fail-closed);
 client-certificate expiry (< 7 days) warns on stderr; the TLS handshake is
@@ -378,6 +380,10 @@ Client and mirror exchange newline-delimited JSON, one message per line,
 tagged by `proto_step`. The same framing runs over stdio (spawned child) or
 TCP (`--serve <port>` daemon + `connectMirror`).
 
+Outbound lines must be non-empty, contain no embedded LF, and be at most
+65,535 UTF-8 bytes before the terminating LF. Stdio, TCP, and TLS enforce the
+same boundary before writing.
+
 ### Client → Mirror
 
 | `proto_step` | Fields | Purpose |
@@ -416,7 +422,7 @@ TCP (`--serve <port>` daemon + `connectMirror`).
 | `explore_rollback_done` | `snapshotId` | Reverted |
 | `explore_session_done` | — | Session closed cleanly |
 | `register_error` | `error` | Registration failed (bad spec/sources); run ends |
-| `protocol_error` | `error` | Protocol violation; in a session, the session **survives** |
+| `protocol_error` | `error` | Protocol violation; the affected connection is closed/poisoned |
 
 `spec` fields have the shape `{ sources: [root, ...deps] }` (TLA+ source
 text, root module first — apalache resolves `EXTENDS` across them).
@@ -475,8 +481,8 @@ strictly alternate until done:
 | Mode | Client side | Mirror side | Notes |
 |---|---|---|---|
 | stdio | `Target.binary` / `spawnMirror binPath` (implicit for `.binary`) | default (no args) | Local child process |
-| TCP | `connectMirror host port` | `ModelMirrors --serve <port>` | One session per connection, sequential accept loop; plain TCP, no TLS |
-| TLS 1.3 mTLS | `ServerMode.connectMirrorTls cfg host port` | `ModelMirrors --server <port> --tls --cert … --key … --ca …` | Mutual auth, CA + hostname/SAN verification, optional `cert-sha256` pin; opt-in (`server-mode/`) |
+| TCP | `connectMirror host port` | `ModelMirrors --serve <port>` | One session per connection; bounded concurrent worker pool; plain TCP |
+| TLS 1.3 mTLS | `ServerMode.connectMirrorTls cfg host port` | `ModelMirrors --server <port> --tls --cert … --key … --ca …` | Mutual auth, CA + SAN-only identity verification, optional `cert-sha256` pin; opt-in (`server-mode/`) |
 | TLS + registry | `ServerMode.connectMirrorDiscovered cfg registryUrl` | same + Consul `/v1/health/service/modelmirrors?passing=true` | Candidates tried in order with registry `cert-sha256` pinning; fail-closed on malformed data |
 
 ## Value Format
@@ -516,6 +522,7 @@ real ModelMirrors binary + apalache:
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.local/bin/apalache/bin:$PATH"
 export MIRROR_BIN=/path/to/ModelMirrors
+export SPEC=/path/to/authoritative/Counter.tla  # optional
 lake build smoke
 .lake/build/bin/smoke
 # smoke (a) trace replay: PASS
@@ -527,7 +534,9 @@ lake build smoke
 ```
 
 Without `MIRROR_BIN` the smoke prints `MIRROR_BIN not set; skipping smoke`
-and exits 0.
+and exits 0. `SPEC` selects the Counter model used by the trace-replay,
+generate-and-replay, and validation scenarios; it defaults to
+`specs/Counter.tla`.
 
 ### Server-mode tests (opt-in package, needs `libssl-dev` + `openssl`)
 
@@ -543,7 +552,7 @@ lake build server-mode-test server-mode-test-discovery \
 .lake/build/bin/server-mode-test          # loopback TLS tests
                                           #   (openssl s_server TLS peer, no apalache):
                                           #   happy path, wrong CA, missing/invalid
-                                          #   client cert, hostname mismatch, TLS 1.2
+                                          #   client cert, hostname/CN-only rejection, TLS 1.2
                                           #   peer, fingerprint pin, key-file mode,
                                           #   EOF mid-session, pinned discovery
 .lake/build/bin/server-mode-test-discovery  # stub-registry tests (in-process
@@ -568,6 +577,7 @@ five flows over mTLS:
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.local/bin/apalache/bin:$PATH"
 export MIRROR_BIN=/path/to/ModelMirrors
+export SPEC=/path/to/authoritative/Counter.tla  # optional
 cd server-mode && .lake/build/bin/server-mode-smoke
 # server-mode smoke (a) trace replay: PASS
 # server-mode smoke (b) generate+replay: PASS

@@ -14,6 +14,7 @@ needed) with an ephemeral PKI (`test/gen-test-certs.sh`) and drives it with
 * T4 missing client cert file -> setup error; client cert signed by an
   unrelated CA -> server rejects the handshake;
 * T5 hostname mismatch -> verification fails;
+* T5b CN-only server certificate -> rejected (SAN required);
 * T6 TLS 1.2-only peer -> the TLS 1.3-only client fails;
 * T7 fingerprint pinning: correct `cert-sha256` connects, a wrong pin is
   rejected before any traffic;
@@ -362,6 +363,19 @@ def main : IO UInt32 := do
 
   -- 6. group/other-readable key file is rejected before connecting.
   ok := ok && (← do
+    let port ← findFreePort
+    let child ← spawnServerWith port "server-cn" dir "-tls1_3"
+    waitReady port
+    let cfg : ServerMode.TlsClientConfig :=
+      { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key",
+        serverName := some "localhost" }
+    let res ← expectFailure "CN-only identity rejected (SAN required)" "mismatch"
+      cfg "127.0.0.1" port 20
+    cleanupServer child
+    pure res)
+
+  -- 7. group/other-readable key file is rejected before connecting.
+  ok := ok && (← do
     let looseKey := dir ++ "/loose.key"
     let cp ← IO.Process.output
       { cmd := "sh", args := #["-c", s!"cp {dir}/client.key {looseKey} && chmod 644 {looseKey}"],
@@ -386,7 +400,7 @@ def main : IO UInt32 := do
           IO.println s!"FAIL  key permission: error {repr msg}"
           pure false)
 
-  -- 7. (T4) client cert signed by an unrelated CA: the server (started with
+  -- 8. (T4) client cert signed by an unrelated CA: the server (started with
   -- `-Verify 1 -verify_return_error` against ca.crt) rejects the handshake.
   -- In TLS 1.3 the server's Finished arrives before it processes the
   -- client's certificate, so the client's connect may complete and the
@@ -412,7 +426,7 @@ def main : IO UInt32 := do
         IO.println s!"FAIL  invalid client cert: unexpected error {repr msg}"
         pure false)
 
-  -- 8. (T4) missing client certificate file fails at setup, before any
+  -- 9. (T4) missing client certificate file fails at setup, before any
   -- connection is attempted (no server needed).
   ok := ok && (← do
     let cfg : ServerMode.TlsClientConfig :=
@@ -430,7 +444,7 @@ def main : IO UInt32 := do
         IO.println s!"FAIL  missing client cert: error {repr msg}"
         pure false)
 
-  -- 9. (T6) a TLS 1.2-only peer: the TLS 1.3-only client must fail.
+  -- 10. (T6) a TLS 1.2-only peer: the TLS 1.3-only client must fail.
   ok := ok && (← do
     let port ← findFreePort
     let child ← spawnServerWith port "server" dir "-tls1_2"
@@ -441,7 +455,7 @@ def main : IO UInt32 := do
     cleanupServer child
     pure res)
 
-  -- 10. (T13) server closes right after the handshake: recv returns none
+  -- 11. (T13) server closes right after the handshake: recv returns none
   -- (EOF), the same transportClosed semantics as plain TCP.
   ok := ok && (← do
     let port ← findFreePort
@@ -466,7 +480,7 @@ def main : IO UInt32 := do
     cleanupServer child
     pure res)
 
-  -- 11. (hardening) idempotent close: closing a TLS transport twice must
+  -- 12. (hardening) idempotent close: closing a TLS transport twice must
   -- be a no-op (the native handle is freed once; a double free would crash).
   ok := ok && (← withServer dir fun port => do
     let cfg : ServerMode.TlsClientConfig :=

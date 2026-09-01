@@ -75,10 +75,10 @@ def counterComputer : IO StateComputer := do
 
 /-- Counter config for the replay/generate/validate flows (canonical spec
 with `CInit`). -/
-def counterCfg (root : System.FilePath) : ApalacheConfig :=
-  { specPath := (root / "specs" / "Counter.tla").toString,
-    invariant := "TraceComplete", lengthBound := 6,
-    constInit := some "CInit", paramVars := some "parameters" }
+def counterCfg (root : System.FilePath) : IO ApalacheConfig := do
+  let selectedSpec := (← IO.getEnv "SPEC").getD ((root / "specs" / "Counter.tla").toString)
+  pure { specPath := selectedSpec, invariant := "TraceComplete", lengthBound := 6,
+         constInit := some "CInit", paramVars := some "parameters" }
 
 /-- `true` when nothing is listening on 127.0.0.1:`port`. -/
 def portFree (port : UInt16) : IO Bool := do
@@ -155,6 +155,7 @@ def withTls (cfg : ServerMode.TlsClientConfig) (port : UInt16)
 
 /-- (a) replay the checked-in violation trace through the mirror. -/
 def replayTrace (fresh : IO Transport) (root : System.FilePath) : IO (Except MirrorError Unit) := do
+  let cfg ← counterCfg root
   let traceFile := root / "specs" / "traces" / "violation.itf.json"
   let traceText ← IO.FS.readFile traceFile
   match parseItfStates traceText with
@@ -162,22 +163,23 @@ def replayTrace (fresh : IO Transport) (root : System.FilePath) : IO (Except Mir
   | .ok states => do
       let compute ← presetClient states
       let tr ← fresh
-      runClientWithTraces (.transport tr) (counterCfg root) #[traceFile] compute
+      runClientWithTraces (.transport tr) cfg #[traceFile] compute
 
 /-- (b) generate fresh counterexample traces and replay them. -/
 def generateAndReplay (fresh : IO Transport) (root : System.FilePath) : IO (Except MirrorError Unit) := do
   let tr ← fresh
-  runClient (.transport tr) (counterCfg root) { numTraces := 10, view := some "View" } (← counterComputer)
+  runClient (.transport tr) (← counterCfg root) { numTraces := 10, view := some "View" } (← counterComputer)
 
 /-- (c) validate-only sessions (TWO sessions, one fresh connection each): a
 valid config reports ok; an invariant that does not exist in the spec is an
 apalache config error -> register_error -> registerFailed. -/
 def validateCases (fresh : IO Transport) (root : System.FilePath) : IO (Except MirrorError Unit) := do
+  let cfg ← counterCfg root
   let tr1 ← fresh
-  match ← runClientValidate (.transport tr1) (counterCfg root) 3 with
+  match ← runClientValidate (.transport tr1) cfg 3 with
   | .error e => pure (.error e)
   | .ok () =>
-      let badCfg : ApalacheConfig := { counterCfg root with invariant := "NoSuchInvariant" }
+      let badCfg : ApalacheConfig := { cfg with invariant := "NoSuchInvariant" }
       let tr2 ← fresh
       match ← runClientValidate (.transport tr2) badCfg 3 with
       | .ok ()        => pure (.error (.unexpectedMessage "validate expected registerFailed"))

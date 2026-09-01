@@ -10,10 +10,9 @@ plus its transitive EXTENDS/INSTANCE closure travels inline in the register
 messages (ApalacheSpec.sources, root first).
 
 Since Lean 4.33 ships no regex module, EXTENDS/INSTANCE detection is a small
-hand-written scanner: strip \\* line comments and (* ... *) block comments
-(nested), match the keywords at line start (possibly indented), split the
-module list on commas, and take the first whitespace-delimited token of each
-entry (dropping WITH substitutions).
+hand-written scanner. It skips \\* line comments, nested (* ... *) comments,
+and strings, then tokenizes identifiers and commas. This recognizes continued
+EXTENDS clauses and INSTANCE in top-level, LOCAL, and expression forms.
 -/
 
 namespace MirrorLean
@@ -59,34 +58,46 @@ private partial def stripCommentsAux : List Char → Nat → List Char → List 
 def stripComments (s : String) : String :=
   String.ofList (stripCommentsAux s.toList 0 [])
 
-/-- Whitespace-split tokens of a line (tabs count as spaces; empty tokens
-dropped; the line is trimmed first). -/
-private def tokens (s : String) : List String :=
-  (s.trimAscii.replace "\t" " ").splitOn " " |>.filter (fun x => x != "")
-
-/-- First whitespace-delimited token, or the empty string. -/
-private def firstToken (s : String) : String :=
-  match tokens s with
-  | [] => ""
-  | x :: _ => x
-
-/-- When the line starts with the keyword, return the module references on
-that line (comma-separated). INSTANCE substitutions (WITH ...) are dropped:
-we cut the line at the first WITH token, so \`INSTANCE A WITH x <- 1, y <- 2\`
-yields only \`A\` and never mistakes a substitution value for a module. -/
-private def moduleRefsOf (kw : String) (line : String) : List String :=
-  match tokens line with
-  | kw' :: rest =>
-      if kw' == kw then
-        let rest' := if kw == "INSTANCE" then rest.takeWhile (fun t => t != "WITH") else rest
-        let joined := String.intercalate " " rest'
-        (joined.splitOn ",").map firstToken |>.filter (fun n => n != "")
-      else []
+/-- Skip a quoted TLA+ string, including escaped characters. -/
+private partial def skipString : List Char → List Char
   | [] => []
+  | '\\' :: _ :: rest => skipString rest
+  | '"' :: rest => rest
+  | _ :: rest => skipString rest
 
-/-- All EXTENDS/INSTANCE module references in a (comment-stripped) source. -/
+/-- Identifier characters used for TLA+ module names and keywords. -/
+private def identStart (c : Char) : Bool := c.isAlpha || c == '_'
+private def identContinue (c : Char) : Bool := c.isAlphanum || c == '_'
+
+/-- Tokenize identifiers and commas outside strings. Comments have already
+been stripped by `stripComments`, including nested block comments. -/
+private partial def dependencyTokens : List Char → List String
+  | [] => []
+  | '"' :: rest => dependencyTokens (skipString rest)
+  | ',' :: rest => "," :: dependencyTokens rest
+  | c :: rest =>
+      if identStart c then
+        let (suffix, tail) := rest.span identContinue
+        String.ofList (c :: suffix) :: dependencyTokens tail
+      else
+        dependencyTokens rest
+
+/-- Remaining names in an EXTENDS comma list after its first module. -/
+private partial def extendsTail : List String → List String
+  | "," :: name :: rest => name :: extendsTail rest
+  | _ => []
+
+/-- Extract EXTENDS and INSTANCE references from the token stream. -/
+private partial def moduleRefsFromTokens : List String → List String
+  | [] => []
+  | "EXTENDS" :: name :: rest =>
+      name :: (extendsTail rest ++ moduleRefsFromTokens rest)
+  | "INSTANCE" :: name :: rest => name :: moduleRefsFromTokens rest
+  | _ :: rest => moduleRefsFromTokens rest
+
+/-- All EXTENDS/INSTANCE module references outside comments and strings. -/
 private def moduleRefs (src : String) : List String :=
-  (src.splitOn "\n").foldl (fun acc line => acc ++ (moduleRefsOf "EXTENDS" line ++ moduleRefsOf "INSTANCE" line)) []
+  moduleRefsFromTokens (dependencyTokens (stripComments src).toList)
     |>.filter (fun n => !(builtins.elem n))
 
 /-- The directory part of a file path (empty tail means the current dir). -/
@@ -101,28 +112,30 @@ modules are loud errors. -/
 private def resolveModule (importDir : String) (name : String) (searchDirs : List String) : IO String := do
   let cands := (importDir :: searchDirs).map (fun d => d ++ "/" ++ name ++ ".tla")
   let existing ← cands.filterM (fun p => (System.FilePath.mk p).pathExists.toIO)
-  match existing with
+  let canonical ← existing.mapM (fun p => (IO.FS.realPath (System.FilePath.mk p)).map (·.toString))
+  let distinct := canonical.foldl (fun acc p => if acc.elem p then acc else acc ++ [p]) []
+  match distinct with
   | [] => throw (IO.userError s!"module {name} not found; searched {cands}")
   | p :: ps =>
-      if ps.any (fun q => q != p) then
+      if !ps.isEmpty then
         throw (IO.userError s!"module {name} is ambiguous: found both {p} and {ps}")
       else pure p
 
 /-- BFS over the dependency closure: resolve each pending module, read it,
-and queue its own references. Visited module names are never re-read. -/
+and queue its own references. Canonical paths are never re-read. -/
 private partial def collectDeps (queue : List (String × String)) (visited : List String)
     (acc : Array String) (searchDirs : List String) : IO (Array String) := do
   match queue with
   | [] => pure acc
   | (importDir, name) :: rest =>
-      if visited.elem name then
+      let path ← resolveModule importDir name searchDirs
+      if visited.elem path then
         collectDeps rest visited acc searchDirs
       else do
-        let path ← resolveModule importDir name searchDirs
         let src ← IO.FS.readFile (System.FilePath.mk path)
         let dir := dirOf path
-        let refs := moduleRefs (stripComments src)
-        collectDeps (rest ++ refs.map (fun r => (dir, r))) (name :: visited) (acc.push src) searchDirs
+        let refs := moduleRefs src
+        collectDeps (rest ++ refs.map (fun r => (dir, r))) (path :: visited) (acc.push src) searchDirs
 
 /-- Read the root spec and its transitive EXTENDS/INSTANCE closure into an
 ApalacheSpec, root source first. searchDirs defaults to TLA_LIBRARY_PATH
@@ -133,11 +146,12 @@ def specFromFiles (root : System.FilePath) (searchDirs : Array System.FilePath :
     | [] => pure ((← IO.getEnv "TLA_LIBRARY_PATH").getD "" |>.splitOn ":" |>.filter (fun d => d != ""))
     | ds => pure (ds.map (fun p => p.toString))
   try
-    let rootPath := root.toString
-    let rootSrc ← IO.FS.readFile root
+    let rootCanonical ← IO.FS.realPath root
+    let rootPath := rootCanonical.toString
+    let rootSrc ← IO.FS.readFile rootCanonical
     let rootDir := dirOf rootPath
-    let refs := moduleRefs (stripComments rootSrc)
-    let deps ← collectDeps (refs.map (fun r => (rootDir, r))) [] #[] dirs
+    let refs := moduleRefs rootSrc
+    let deps ← collectDeps (refs.map (fun r => (rootDir, r))) [rootPath] #[] dirs
     pure (.ok { sources := #[rootSrc] ++ deps })
   catch e =>
     pure (.error { msg := IO.Error.toString e, contexts := #[] })

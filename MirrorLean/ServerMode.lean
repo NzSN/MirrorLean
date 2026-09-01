@@ -141,6 +141,7 @@ def connectMirrorTls (cfg : TlsClientConfig) (host : String) (port : UInt16) : I
   let t : Transport :=
     {
       send := fun line => do
+        MirrorLean.validateProtocolLine line
         let payload := line ++ "\n"
         if debugTls then do
           IO.eprintln s!"mirrorlean TLS >> {payload.length} bytes"
