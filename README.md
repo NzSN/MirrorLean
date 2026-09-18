@@ -1,5 +1,9 @@
 # MirrorLean
 
+See the [framework map](../Mirrors/Docs/framework-map.md) for current language support.
+Typed network jobs use [Connection](MirrorLean/Async.lean); a Lean negotiated
+binding, generated target and native Gate evaluator remain future work.
+
 Lean 4 client for the [ModelMirrors](https://github.com/NzSN/ModelMirrors) protocol — model-based testing of state machines against TLA+ specs: replay model-generated traces or drive interactive symbolic exploration, over stdio, TCP, or TLS 1.3 mTLS, including server-mode async jobs.
 
 ## Architecture
@@ -189,15 +193,28 @@ explorer commands yourself; the mirror proxies each one to the apalache
 server.
 
 ```lean
-let s ← startExploreSession t spec #["TraceComplete"] #[]
--- s.ready : { initTransitions, nextTransitions, stateInvariants }
-ExploreSession.assumeTransition s 0      -- → .enabled | .disabled | .unknown
-ExploreSession.nextStep s                -- → step number
-let st ← ExploreSession.queryState s     -- → State
-ExploreSession.checkInvariant s 0        -- → .satisfied | .violated | .unknown
-ExploreSession.assumeState s st          -- → .enabled | .disabled | .unknown
-ExploreSession.rollback s 0              -- → snapshot id
-ExploreSession.done s                    -- ends the session and closes the mirror
+import MirrorLean
+open MirrorLean
+
+def explorerExample (t : Target) (spec : ApalacheSpec) : IO Unit := do
+  let expectOk {α : Type} (result : Except MirrorError α) : IO α :=
+    match result with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (MirrorError.toString error))
+  let s ← expectOk (← startExploreSession t spec #["TraceComplete"] #[])
+  try
+    let _ ← expectOk (← ExploreSession.assumeTransition s 0)
+    let _ ← expectOk (← ExploreSession.nextStep s)
+    let state ← expectOk (← ExploreSession.queryState s)
+    let _ ← expectOk (← ExploreSession.checkInvariant s 0)
+    let _ ← expectOk (← ExploreSession.assumeState s state)
+    let _ ← expectOk (← ExploreSession.rollback s 0)
+    expectOk (← ExploreSession.done s)
+  catch primary =>
+    try
+      let _ ← ExploreSession.done s
+    catch _ => pure ()
+    throw primary
 ```
 
 Commands and replies strictly alternate. A `protocol_error`, malformed reply,

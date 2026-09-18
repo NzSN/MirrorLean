@@ -3,7 +3,10 @@
 **A Lean 4 client for the ModelMirrors protocol**
 
 Date: 2026-08-18
-Status: Proposed (awaiting review)
+Status: Historical design baseline. The client is implemented and now includes
+native mTLS and typed async jobs. The [README](../README.md) and
+[Async API](../MirrorLean/Async.lean) describe current behavior; older sketches
+and milestone counts below are not a current support inventory.
 
 MirrorLean is a faithful, idiomatic Lean 4 port of the
 [ModelMirrors](https://github.com/NzSN/ModelMirrors) client, on parity with
@@ -354,6 +357,7 @@ structure Transport where
 ', flushes
   recv  : IO (Option String)          -- one line, or none at EOF
   close : IO UInt32                   -- mirror exit code
+  asyncCapable : Bool := false        -- concrete TCP/mTLS transports set true
 
 def spawnMirror (binPath : System.FilePath) : IO Transport
 def connectMirror (host : String) (port : UInt16) : IO Transport
@@ -363,22 +367,16 @@ inductive Target
   | transport (t : Transport)
 ```
 
-- **Stdio transport:** `IO.Process.spawn` with `stdin := piped, stdout := piped, stderr := inherit`.
-  `send` writes the line + `"
-"` via `IO.FS.Stream.putStrLn` and **flushes**
-  (MirrorRust's fix — unflushed pipes deadlock before `recv`). `recv` uses
-  `IO.FS.Stream.getLine`; a trailing empty read is distinguished from EOF by
-  peeking `IO.FS.Handle.read 0`-style EOF detection so a legitimately empty line
-  can't be confused with stream close. `close` = `Child.takeStdin` (EOF to the
-  mirror) then `Child.wait` → exit code.
-- **TCP transport:** `Std.Async.TCP.Socket.Client.mk` → resolve host:port
-  (`Std.Net`/`Std.Async.DNS`) → `connect`, then `.block` the `Async` into `IO`
-  at each call. `send` = `Client.send (line ++ "
-" as ByteArray)`, `recv` = a
-  small buffered line reader over `Client.recv? 4096` that accumulates bytes and
-  splits on `
-`, returning `none` on `recv? = none` (EOF) or `0`-byte reads.
-  `close` = `Client.shutdown`.
+- **Stdio transport:** `IO.Process.spawn` with piped stdin/stdout and inherited
+  stderr. `send` writes one line plus `\n` and flushes. The bounded
+  `readHandleFrame` reader returns `none` only on clean EOF; malformed UTF-8,
+  empty/oversized frames and partial final frames raise an error. Close drops
+  stdin and waits for the child exit code.
+- **TCP transport:** resolve the endpoint and connect using `Std.Async.TCP`.
+  `send` writes `line ++ "\n"`. The shared TCP/TLS `recvLine` buffers chunks,
+  enforces the 65,535-byte payload limit and strict UTF-8, and rejects a partial
+  final frame. `asyncCapable` is true for concrete TCP/mTLS transports and false
+  by default for stdio/custom transports. Close shuts down the connection.
 - **TLS 1.3 transport + registry discovery (implemented, opt-in):**
   `MirrorLean.ServerMode` (in the root library; native shim + executables in
   the separate `server-mode/` package) provides `connectMirrorTls`
