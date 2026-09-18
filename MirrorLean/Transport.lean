@@ -29,9 +29,8 @@ A bidirectional, newline-delimited byte stream to a mirror process.
 
 * `send` writes one line (terminated with `\n`) and flushes, so the mirror
   reliably receives the frame before `recv` is called (unflushed pipes deadlock).
-* `recv` blocks for the next line and returns `none` at end-of-file. A genuine
-  empty line comes back as `some ""` (the `\n` is the line terminator, so an
-  empty `getLine` result unambiguously means EOF).
+* `recv` blocks for the next complete frame and returns `none` on clean EOF.
+  Empty, oversized, invalid-UTF-8 and unterminated frames raise an I/O error.
 * `close` signals end-of-file to the mirror's standard input and returns its
   exit code (`UInt32`).
 -/
@@ -39,6 +38,8 @@ structure Transport where
   send  : String → IO Unit
   recv  : IO (Option String)
   close : IO UInt32
+  /-- True only for network transports; async jobs are unavailable on stdio. -/
+  asyncCapable : Bool := false
 
 /-- Maximum UTF-8 payload size before the terminating LF is appended. -/
 def maxProtocolLineBytes : Nat := 65535
@@ -65,6 +66,30 @@ def stripLineEnding (s : String) : String :=
   let s := if s.endsWith "\n" then (s.dropEnd 1).copy else s
   if s.endsWith "\r" then (s.dropEnd 1).copy else s
 
+/-- Decode one complete frame, enforcing the byte limit before UTF-8 decoding. -/
+def decodeProtocolFrame (bytes : ByteArray) : IO String := do
+  let payload := if bytes.size > 0 && bytes[bytes.size - 1]! == 13 then
+      bytes.extract 0 (bytes.size - 1) else bytes
+  if payload.size > maxProtocolLineBytes then
+    throw (IO.userError "protocol line exceeds 65535-byte UTF-8 payload limit")
+  if payload.isEmpty then throw (IO.userError "empty protocol frame")
+  match String.fromUTF8? payload with
+  | some line => pure line
+  | none => throw (IO.userError "invalid UTF-8 protocol frame")
+
+/-- Bounded stdio reader. Reads no byte beyond the current frame. -/
+private partial def readHandleFrame (handle : IO.FS.Handle) (bytes : ByteArray := .empty)
+    : IO (Option String) := do
+  let next ← handle.read 1
+  if next.isEmpty then
+    if bytes.isEmpty then return none
+    else throw (IO.userError "truncated protocol frame at EOF")
+  if next[0]! == 10 then return some (← decodeProtocolFrame bytes)
+  if bytes.size >= maxProtocolLineBytes &&
+      !(bytes.size == maxProtocolLineBytes && next[0]! == 13) then
+    throw (IO.userError "protocol line exceeds 65535-byte UTF-8 payload limit")
+  readHandleFrame handle (bytes ++ next)
+
 /--
 Wrap an already-spawned piped child in a `Transport`.
 
@@ -81,12 +106,7 @@ def Transport.ofChild (child : StdioPipedChild) : Transport :=
       validateProtocolLine line
       IO.FS.Handle.putStrLn stdin line
       IO.FS.Handle.flush stdin,
-    recv := do
-      let line ← IO.FS.Handle.getLine stdout
-      if line.isEmpty then
-        pure none
-      else
-        pure (some (stripLineEnding line)),
+    recv := readHandleFrame stdout,
     close := do
       let (_, child') ← child.takeStdin
       child'.wait
@@ -120,8 +140,8 @@ Read the next complete newline-terminated line, buffering partial reads.
 Bytes accumulate in a buffer shared across calls (held in an `IO.Ref`); a single
 `recv` may deliver several lines (or a partial line), so we split on `\n`
 exactly once per call. A trailing `\r` is stripped (defensive CRLF handling).
-EOF (a `none` from `recv`, or a zero-byte read) with no complete line in the
-buffer yields `none`.
+EOF with an empty buffer yields `none`; a partial frame at EOF is an error.
+The payload is bounded before further reads and decoded as strict UTF-8.
 
 This is the shared newline-framing helper used by the TCP transport and the
 TLS transport (`MirrorLean.ServerMode`); `recv` is any action returning the
@@ -134,16 +154,22 @@ partial def recvLine (recv : IO (Option ByteArray)) (buf : IO.Ref ByteArray)
   | some i =>
       let lineBytes := b.extract 0 i
       buf.set (b.extract (i + 1) b.size)
-      let line := (String.fromUTF8? lineBytes).getD ""
-      pure (some (if line.endsWith "\r" then (line.dropEnd 1).copy else line))
+      return some (← decodeProtocolFrame lineBytes)
   | none =>
-      match ← recv with
-      | none => pure none
+      if b.size > maxProtocolLineBytes &&
+          !(b.size == maxProtocolLineBytes + 1 && b[b.size - 1]! == 13) then
+        throw (IO.userError "protocol line exceeds 65535-byte UTF-8 payload limit")
+      let chunk ← recv
+      match chunk with
+      | none =>
+          if b.isEmpty then return none
+          else throw (IO.userError "truncated protocol frame at EOF")
       | some bs =>
-          if bs.isEmpty then pure none
-          else do
-            buf.set (b ++ bs)
-            recvLine recv buf
+          if bs.isEmpty then
+            if b.isEmpty then return none
+            else throw (IO.userError "truncated protocol frame at EOF")
+          buf.set (b ++ bs)
+          recvLine recv buf
 
 /-- Resolve a host:port pair to a socket address (DNS first, then literal IP). -/
 private def resolveAddress (host : String) (port : UInt16) : IO Std.Net.SocketAddress := do
@@ -179,7 +205,7 @@ def connectMirror (host : String) (port : UInt16) : IO Transport := do
   let buf ← IO.mkRef (ByteArray.empty : ByteArray)
   let recvFn : IO (Option ByteArray) := Std.Async.Async.block (Std.Async.TCP.Socket.Client.recv? client 4096)
   let t : Transport :=
-    {
+    { asyncCapable := true,
       send := fun line => do
         validateProtocolLine line
         Std.Async.Async.block (Std.Async.TCP.Socket.Client.send client ((line ++ "\n").toUTF8))

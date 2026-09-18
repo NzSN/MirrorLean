@@ -139,7 +139,7 @@ def connectMirrorTls (cfg : TlsClientConfig) (host : String) (port : UInt16) : I
       tlsFail "TLS recv" rerr
     if data.isEmpty then pure none else pure (some data)
   let t : Transport :=
-    {
+    { asyncCapable := true,
       send := fun line => do
         MirrorLean.validateProtocolLine line
         let payload := line ++ "\n"

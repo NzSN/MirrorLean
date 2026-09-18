@@ -16,8 +16,8 @@ and `input_dir`, and both `extern_lib` and custom `target` declarations (plus
 root module in lakefile.toml") is not expressible in this Lake version, and
 we take the plan's documented fallback: a separate top-level package.
 
-Consequence (the important one): the root `lakefile.toml` stays
-**byte-identical**, so the baseline `lake build` / `lake build test` /
+Consequence: the root `lakefile.toml` remains free of native TLS link
+requirements (pure async client/test targets are additive), so `lake build` / `lake build test` /
 `smoke` targets can never accidentally gain an OpenSSL dependency. Server
 mode is opt-in at build time: `cd server-mode && lake build`.
 

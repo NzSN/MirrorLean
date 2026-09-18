@@ -76,7 +76,7 @@ private def recvMsg (t : Transport) : IO (Except MirrorError MirrorMessage) := d
 
 /-- Close the transport and return an error (used on every exit path). -/
 private def closeErr {α : Type} (t : Transport) (e : MirrorError) : IO (Except MirrorError α) := do
-  let _ ← t.close
+  try let _ ← t.close catch _ => pure ()
   pure (.error e)
 
 /-- The replay loop after `spec_validated {result := valid}`. -/
@@ -100,9 +100,8 @@ private partial def replayLoop (t : Transport) (compute : StateComputer)
           let _ ← t.close
           pure (.ok ())
       | .stepMismatch action? expected actual hints => do
-          let _ ← t.close
-          pure (.error (.stepMismatch
-            { action := action?.getD lastAction, params := lastParams, expected, actual, hints }))
+          closeErr t (.stepMismatch
+            { action := action?.getD lastAction, params := lastParams, expected, actual, hints })
       | .protocolError d => closeErr t (.protocol d)
       | .registerError d => closeErr t (.registerFailed d)
       | other => closeErr t (.unexpectedMessage (stepName other))
@@ -149,7 +148,7 @@ private def withClose (tr : Transport) {α : Type} (body : IO (Except MirrorErro
   try
     body
   catch e =>
-    let _ ← tr.close
+    try let _ ← tr.close catch _ => pure ()
     pure (.error (.io e))
 
 /-- Replay: `register`, then the main loop. -/
@@ -233,6 +232,8 @@ def runClientExplore (t : Target) (spec : ApalacheSpec) (invariants exports : Ar
 session ends (design 8.6). -/
 def runClientValidate (t : Target) (cfg : ApalacheConfig) (bound : Nat)
     (spec? : Option ApalacheSpec := none) : IO (Except MirrorError Unit) := do
+  if bound < 1 || bound > 100 then
+    return .error (.protocol "validate bound must be in [1, 100]")
   let tr ← resolveTarget t
   withClose tr do
     tr.send (ClientMessage.encode (.registerValidate cfg bound spec?))

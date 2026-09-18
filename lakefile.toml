@@ -15,3 +15,11 @@ root = "examples.Counter"
 [[lean_exe]]
 name = "smoke"
 root = "test.Smoke"
+
+[[lean_exe]]
+name = "async-test"
+root = "test.Async"
+
+[[lean_lib]]
+name = "AsyncTestSupport"
+roots = ["test.AsyncSupport"]

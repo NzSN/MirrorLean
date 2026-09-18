@@ -1,5 +1,6 @@
 import MirrorLean
 import MirrorLean.ServerMode
+import test.AsyncSupport
 
 /-!
 # MirrorLean server-mode E2E smoke (gated on MIRROR_BIN)
@@ -272,6 +273,12 @@ def main : IO UInt32 := do
   ok := ok && (← runFlow "c) validate" cfg port (fun fresh => validateCases fresh root))
   ok := ok && (← runFlow "d) register_explore" cfg port (fun fresh => exploreMode fresh root))
   ok := ok && (← runFlow "e) explore-session walk" cfg port (fun fresh => exploreSessionWalk fresh root))
+  try
+    AsyncTests.live (ServerMode.connectMirrorTls cfg "127.0.0.1" port)
+    IO.println "server-mode smoke f) async concurrent jobs: PASS"
+  catch e =>
+    IO.eprintln s!"server-mode async FAILED: {e}"
+    ok := false
   try child.kill catch _ => pure ()
   _ ← child.wait
   if ok then

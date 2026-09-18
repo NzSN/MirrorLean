@@ -356,8 +356,8 @@ def testTransportEof : IO Bool := do
     { cmd := "/bin/sh", args := #["-c", "echo; echo done"], stdin := .piped, stdout := .piped, stderr := .inherit }
   let child : StdioPipedChild ← IO.Process.spawn args
   let t := Transport.ofChild child
-  let e1 ← t.recv
-  let a ← checkEq "transport empty line -> some \"\"" (e1.getD "NONE") ""
+  let rejected ← try let _ ← t.recv; pure false catch _ => pure true
+  let a ← check "transport rejects empty frame" rejected
   let e2 ← t.recv
   let b ← checkEq "transport line #2" (e2.getD "NONE") "done"
   let e3 ← t.recv

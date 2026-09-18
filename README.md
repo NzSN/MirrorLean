@@ -1,6 +1,6 @@
 # MirrorLean
 
-Lean 4 client for the [ModelMirrors](https://github.com/NzSN/ModelMirrors) protocol — model-based testing of state machines against TLA+ specs: replay model-generated traces or drive interactive symbolic exploration, over stdio or TCP.
+Lean 4 client for the [ModelMirrors](https://github.com/NzSN/ModelMirrors) protocol — model-based testing of state machines against TLA+ specs: replay model-generated traces or drive interactive symbolic exploration, over stdio, TCP, or TLS 1.3 mTLS, including server-mode async jobs.
 
 ## Architecture
 
@@ -50,7 +50,7 @@ export PATH="$HOME/.elan/bin:$PATH"
 lake build                # build the MirrorLean library
 lake build test           # build the unit-test binary
 lake build smoke          # build the end-to-end smoke binary
-.lake/build/bin/test      # 115 tests, 0 failures
+.lake/build/bin/test      # prints the current test count and failure summary
 ```
 
 The smoke binary additionally needs a ModelMirrors binary and apalache-mc on
@@ -507,7 +507,7 @@ tuple, map, record, variant, unserializable, null.)
 ```bash
 export PATH="$HOME/.elan/bin:$PATH"
 lake build test
-.lake/build/bin/test      # 115 tests, 0 failures
+.lake/build/bin/test      # prints the current test count and failure summary
 ```
 
 The unit suite covers ITF value round-trips, error rendering
@@ -608,3 +608,65 @@ generate/replay/validate paths keep the canonical `Counter.tla` with
 
 The design's `ExploreSession.open` is spelled `ExploreSession.start`
 (`startExploreSession` alias).
+
+## Current conformance and remote operation
+
+The normative contract is the [Mirrors client guide](../Mirrors/Docs/client-implementation-guide.md).
+For server setup and certificate/remote-file rules, see the
+[remote server runbook](../Mirrors/Docs/remote-server-guide.md). Inline model
+sources and their dependency closure are separate from server-visible trace
+paths. A remote `destPath` never names a local client directory. Consume inline
+trace results on network connections; `TRACE_RESULT_TOO_LARGE` is an explicit
+backend failure, not permission to launch Apalache directly as a fallback.
+
+Server async jobs and asynchronous SUT operations are different features. The
+submitting connection owns its jobs: other connections can query or await them,
+but disconnecting the owner cancels and evicts them. Job IDs are not durable
+handles. Await timeouts return current status; stop polling cancelled or unknown
+jobs. Logical cancellation can precede physical backend cleanup.
+
+Shared async reply fixtures live under the client's test fixtures and originate
+in `Mirrors/test/client-conformance/async-replies.json`. The focused acceptance
+runner is `APALACHE_MC=/path/to/apalache-mc bash ../Mirrors/tools/interop/clients.sh`.
+It requires live dependencies and checks fixture copies before running all three
+clients. Unit tests do not prove runtime heap leak-freedom.
+
+### Typed async job connection
+
+`MirrorLean.Async` is exported by `import MirrorLean`. Adopt one TCP or mTLS
+transport with `Connection.ofTransport`; stdio is rejected before any write.
+Use `submitValidateAsync`, `submitTraceGenAsync`, `queryJob`, `awaitJob`, and
+`cancelJob`. Requests and replies are typed as `JobRequest` / `JobReply`, with
+`JobKind`, `JobPhase` and `JobOutcome`. These additive types leave the synchronous
+replay message API intact. An accepted submission is `.accepted id kind`;
+`.status id phase` and `.result id outcome` distinguish pending/unknown/cancelled
+states from retained terminal payloads. An outcome error is not a valid model.
+
+```lean
+let connection ← MirrorLean.Connection.ofTransport
+  (← MirrorLean.connectMirror "127.0.0.1" 8998)
+try
+  -- cfg and sources are your reviewed ApalacheConfig and ApalacheSpec.
+  let submitted ← connection.submitValidateAsync cfg 3 (some sources)
+  match submitted with
+  | .ok (.accepted id _) =>
+      let reply ← connection.awaitJob id (some 30)
+      -- Inspect reply; pending/running means another await is needed.
+      match reply with
+      | .error e => IO.eprintln (MirrorLean.MirrorError.toString e)
+      | .ok _ => pure ()
+  | .error e => IO.eprintln (MirrorLean.MirrorError.toString e)
+  | _ => throw (IO.userError "unexpected submission reply")
+finally
+  connection.close
+```
+
+The connection owns and serializes its transport; do not also use raw reads or
+one-shot replay on that transport. `close` is idempotent. Send/read/decode and
+correlation failures poison it, and cleanup errors cannot replace the original
+failure. Stdio, TCP and mTLS receive paths now reject oversized, empty,
+invalid-UTF-8 and unterminated frames. Validation bounds are checked before writes.
+Run `lake build test smoke async-test`, the unit binary, and `async-test` with
+`MIRROR_BIN` / `APALACHE_MC` set for real concurrent TCP coverage. The separate
+server-mode smoke includes the same async lifecycle over mTLS. No model-interface
+negotiation/generated Lean binding or native Gate facade is claimed yet.

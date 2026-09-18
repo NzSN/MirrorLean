@@ -1,0 +1,104 @@
+{
+  "schema": "mirrors.client-async-replies/v1",
+  "cases": [
+    {
+      "name": "terminal-query",
+      "request": {
+        "proto_step": "query_job",
+        "jobId": "job-1"
+      },
+      "reply": {
+        "proto_step": "job_result",
+        "jobId": "job-1",
+        "outcome": {
+          "validate": "valid"
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "pending-await",
+      "request": {
+        "proto_step": "await_job",
+        "jobId": "job-1",
+        "timeoutSecs": 1
+      },
+      "reply": {
+        "proto_step": "job_status",
+        "jobId": "job-1",
+        "phase": "pending"
+      },
+      "accept": true
+    },
+    {
+      "name": "unknown-query",
+      "request": {
+        "proto_step": "query_job",
+        "jobId": "job-1"
+      },
+      "reply": {
+        "proto_step": "job_status",
+        "jobId": "job-1",
+        "phase": "unknown"
+      },
+      "accept": true
+    },
+    {
+      "name": "wrong-id-status",
+      "request": {
+        "proto_step": "query_job",
+        "jobId": "job-1"
+      },
+      "reply": {
+        "proto_step": "job_status",
+        "jobId": "job-2",
+        "phase": "running"
+      },
+      "accept": false
+    },
+    {
+      "name": "wrong-id-result",
+      "request": {
+        "proto_step": "await_job",
+        "jobId": "job-1",
+        "timeoutSecs": 1
+      },
+      "reply": {
+        "proto_step": "job_result",
+        "jobId": "job-2",
+        "outcome": {
+          "validate": "valid"
+        }
+      },
+      "accept": false
+    },
+    {
+      "name": "wrong-submit-kind",
+      "request": {
+        "proto_step": "register_validate_async"
+      },
+      "reply": {
+        "proto_step": "job_accepted",
+        "jobId": "job-1",
+        "kind": "gen_traces"
+      },
+      "accept": false
+    },
+    {
+      "name": "trace-too-large",
+      "request": {
+        "proto_step": "await_job",
+        "jobId": "job-1",
+        "timeoutSecs": 1
+      },
+      "reply": {
+        "proto_step": "job_result",
+        "jobId": "job-1",
+        "outcome": {
+          "error": "TRACE_RESULT_TOO_LARGE: compact result exceeds wire limit"
+        }
+      },
+      "accept": true
+    }
+  ]
+}
