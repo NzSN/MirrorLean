@@ -136,6 +136,10 @@ where
   falling back to a record for any other object. {"#bigint": ""} decodes to
   null per the protocol spec. -/
   ofJsonObject? (o : Std.TreeMap.Raw String Lean.Json) : Except String Value := do
+    -- ITF container tags are singleton objects. A marker-looking field in an
+    -- ordinary multi-field record must not discard its other fields.
+    if o.size > 1 && !(o.size == 2 && o.contains "tag" && o.contains "value") then
+      return ← decodeRecord o
     if let some jv := o.get? "#bigint" then
       let s ← jv.getStr?
       if s == "" then

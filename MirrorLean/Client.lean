@@ -79,32 +79,53 @@ private def closeErr {α : Type} (t : Transport) (e : MirrorError) : IO (Except 
   try let _ ← t.close catch _ => pure ()
   pure (.error e)
 
-/-- The replay loop after `spec_validated {result := valid}`. -/
-private partial def replayLoop (t : Transport) (compute : StateComputer)
-    (lastAction : String) (lastParams prevState : State) : IO (Except MirrorError Unit) := do
-  match ← recvMsg t with
-  | .error e => closeErr t e
+/-- Internal replay dispatcher shared by handwritten and generated bindings.
+The caller supplies its error carrier and decoding policy, and owns resource
+cleanup. Callback, send and receive IO exceptions remain visible to that scope. -/
+partial def Internal.replay {ε : Type} (t : Transport)
+    (compute : String → State → State → IO (Except ε State))
+    (fromLegacy : MirrorError → ε)
+    (decode : String → Except MirrorError MirrorMessage := MirrorMessage.decode)
+    (lastAction : String := "") (lastParams prevState : State := ∅) : IO (Except ε Unit) := do
+  let incoming ← t.recv
+  let decoded : Except MirrorError MirrorMessage := match incoming with
+    | none => .error MirrorError.transportClosed
+    | some line => decode line
+  match decoded with
+  | .error e => pure (.error (fromLegacy e))
   | .ok msg =>
       match msg with
       | .initialState action state => do
-          let s ← compute action state (State.ofList [])
+          let s ← match ← compute action state (State.ofList []) with
+            | .ok s => pure s
+            | .error error => return .error error
           t.send (ClientMessage.encode (.reportState s))
-          replayLoop t compute action lastParams s
+          Internal.replay t compute fromLegacy decode action lastParams s
       | .nextStep action parameters => do
-          let s ← compute action parameters prevState
+          let s ← match ← compute action parameters prevState with
+            | .ok s => pure s
+            | .error error => return .error error
           t.send (ClientMessage.encode (.reportState s))
-          replayLoop t compute action parameters s
+          Internal.replay t compute fromLegacy decode action parameters s
       | .stepOk =>
-          replayLoop t compute lastAction lastParams prevState
-      | .allStepsDone => do
-          let _ ← t.close
-          pure (.ok ())
-      | .stepMismatch action? expected actual hints => do
-          closeErr t (.stepMismatch
-            { action := action?.getD lastAction, params := lastParams, expected, actual, hints })
-      | .protocolError d => closeErr t (.protocol d)
-      | .registerError d => closeErr t (.registerFailed d)
-      | other => closeErr t (.unexpectedMessage (stepName other))
+          Internal.replay t compute fromLegacy decode lastAction lastParams prevState
+      | .allStepsDone => pure (.ok ())
+      | .stepMismatch action? expected actual hints =>
+          pure (.error (fromLegacy (.stepMismatch
+            { action := action?.getD lastAction, params := lastParams, expected, actual, hints })))
+      | .protocolError d => pure (.error (fromLegacy (.protocol d)))
+      | .registerError d => pure (.error (fromLegacy (.registerFailed d)))
+      | other => pure (.error (fromLegacy (.unexpectedMessage (stepName other))))
+
+/-- Legacy error and transport ownership remain unchanged around the common
+fallible dispatcher. -/
+private def replayLoop (t : Transport) (compute : StateComputer)
+    (lastAction : String) (lastParams prevState : State) : IO (Except MirrorError Unit) := do
+  let result ← Internal.replay t (fun action params previous =>
+    return .ok (← compute action params previous)) id MirrorMessage.decode lastAction lastParams prevState
+  match result with
+  | .error error => closeErr t error
+  | .ok () => let _ ← t.close; pure (.ok ())
 
 /-- The replay main loop (register / register_traces / register_explore). -/
 private def mainLoop (t : Transport) (compute : StateComputer) : IO (Except MirrorError Unit) := do

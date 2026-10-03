@@ -5,6 +5,7 @@ import MirrorLean.Transport
 import MirrorLean.Client
 import MirrorLean.Spec
 import MirrorLean.Async
+import MirrorLean.ModelInterface
 
 /-!
 # MirrorLean

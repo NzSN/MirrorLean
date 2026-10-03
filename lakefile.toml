@@ -23,3 +23,7 @@ root = "test.Async"
 [[lean_lib]]
 name = "AsyncTestSupport"
 roots = ["test.AsyncSupport"]
+
+[[lean_exe]]
+name = "model-interface-test"
+root = "test.ModelInterface"
