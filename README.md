@@ -1,8 +1,13 @@
 # MirrorLean
 
 See the [framework map](../Mirrors/Docs/framework-map.md) for current language support.
-Typed network jobs use [Connection](MirrorLean/Async.lean); a Lean negotiated
-binding, generated target and native Gate evaluator remain future work.
+Typed network jobs use [Connection](MirrorLean/Async.lean).
+The `mirrorlean-v1` generated target and exact-key negotiated replay through
+[ModelInterface](MirrorLean/ModelInterface.lean) are implemented. Their
+[contract and acceptance](../Mirrors/Docs/model-interface-compiler/lean-target.md)
+remain separately bound; native Lean Gate evaluation is still a future profile.
+[Current framework status](../Mirrors/Docs/current-status.md) distinguishes the
+newer source checkout from M5's separately pinned compatibility client.
 
 Lean 4 client for the [ModelMirrors](https://github.com/NzSN/ModelMirrors) protocol — model-based testing of state machines against TLA+ specs: replay model-generated traces or drive interactive symbolic exploration, over stdio, TCP, or TLS 1.3 mTLS, including server-mode async jobs.
 
