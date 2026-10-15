@@ -15,15 +15,18 @@ needed) with an ephemeral PKI (`test/gen-test-certs.sh`) and drives it with
   unrelated CA -> server rejects the handshake;
 * T5 hostname mismatch -> verification fails;
 * T5b CN-only server certificate -> rejected (SAN required);
+* T5c empty effective identity -> public and native rejection before credentials
+  or socket acquisition, including with a correct pin;
 * T6 TLS 1.2-only peer -> the TLS 1.3-only client fails;
 * T7 fingerprint pinning: correct `cert-sha256` connects, a wrong pin is
   rejected before any traffic;
-* T8 group/other-readable key file (0644) -> rejected before connect;
+* T8 exact POSIX key mode: 0600 accepts; owner-only deviations, group/other
+  permissions and supported special bits reject before connect without mutation;
 * T11 pinned discovery: bad pin candidate skipped, good candidate used;
 * T13 EOF mid-session: server closes right after the handshake -> `recv`
   returns `none` (the same `transportClosed` semantics as plain TCP).
 
-Requires `openssl` on PATH. `main` must stay top-level (exe root module).
+Requires `openssl` and `python3` on PATH. `main` must stay top-level (exe root module).
 -/
 
 open MirrorLean
@@ -149,6 +152,155 @@ def certFingerprint (dir : String) (stem : String) : IO String := do
   | some hex => pure hex.trimAscii.toString
   | none => throw (IO.userError s!"cannot parse fingerprint from {repr out.stdout}")
 
+/-- Observe a bounded owned listener, then join it and assert zero accepts.
+An unused port alone would not prove that the client never acquired a socket. -/
+def withoutConnection (label : String) (body : UInt16 → IO Bool) : IO Bool := do
+  let appDir ← IO.appDir
+  let script := appDir / "../../../test/no-connect-listener.py"
+  let child ← IO.Process.spawn
+    { cmd := "python3", args := #[script.toString],
+      stdin := .piped, stdout := .piped, stderr := .piped }
+  try
+    let portLine ← child.stdout.getLine
+    match portLine.trimAscii.toString.toNat? with
+    | none =>
+        check s!"{label}: listener startup" false
+    | some port =>
+        let result ← body (UInt16.ofNat port)
+        child.stdin.putStrLn "done"
+        child.stdin.flush
+        let count ← child.stdout.getLine
+        let exitCode ← child.wait
+        let noAccept ← check s!"{label}: zero acquired sockets"
+          (exitCode == 0 && count.trimAscii.toString == "DONE 0")
+        pure (result && noAccept)
+  finally
+    try child.kill catch _ => pure ()
+    try _ ← child.wait catch _ => pure ()
+
+/-- Public and raw native identity guards precede credential errors and I/O. -/
+def testEmptyIdentity (dir : String) : IO Bool := do
+  let fp ← certFingerprint dir "server"
+  let base : ServerMode.TlsClientConfig :=
+    { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
+  withoutConnection "empty TLS identity" fun port => do
+    let mut ok := true
+    for pin in #[none, some fp] do
+      let cfg := { base with serverName := some "", expectedCertSha256 := pin }
+      ok := (← expectFailure s!"empty override (pinned={pin.isSome})"
+        "TLS server identity must be nonempty" cfg "127.0.0.1" port 0) && ok
+    ok := (← expectFailure "empty default host"
+      "TLS server identity must be nonempty" base "" port 0) && ok
+    let missing : ServerMode.TlsClientConfig :=
+      { base with
+        caFile := dir ++ "/missing-ca.crt"
+        certFile := dir ++ "/missing-client.crt"
+        keyFile := dir ++ "/missing-client.key"
+        serverName := some "" }
+    ok := (← expectFailure "public identity precedes missing credentials"
+      "TLS server identity must be nonempty" missing "127.0.0.1" port 0) && ok
+    for cfg in #[base, missing] do
+      let (err, h) ← ServerMode.tlsConnect cfg.caFile.toString cfg.certFile.toString
+        cfg.keyFile.toString "" "127.0.0.1" port
+      if h != 0 then ServerMode.tlsClose h
+      ok := (← check "raw native empty identity precedes credentials"
+        (h == 0 && err == "TLS server identity must be nonempty")) && ok
+    pure ok
+
+/-- Explicit DNS SAN and pin controls retain SAN-only authentication. -/
+def testIdentityAndPins (dir : String) : IO Bool := do
+  let mut ok := true
+  let fp ← certFingerprint dir "server"
+  let cnFp ← certFingerprint dir "server-cn"
+  let base : ServerMode.TlsClientConfig :=
+    { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := dir ++ "/client.key" }
+  for pin in #[none, some fp] do
+    ok := (← withServer dir fun port => do
+      let cfg := { base with serverName := some "localhost", expectedCertSha256 := pin }
+      let t ← retryConnect cfg "127.0.0.1" port 20
+      try
+        t.send "racecar"
+        check s!"explicit DNS SAN (pinned={pin.isSome})" ((← t.recv) == some "racecar")
+      finally
+        let _ ← t.close
+        pure ()) && ok
+    ok := (← withServer dir fun port => do
+      let cfg := { base with serverName := some "wrong.example", expectedCertSha256 := pin }
+      expectFailure s!"wrong DNS SAN (pinned={pin.isSome})" "mismatch"
+        cfg "127.0.0.1" port 20) && ok
+  for pin in #[none, some cnFp] do
+    let port ← findFreePort
+    let child ← spawnServerWith port "server-cn" dir "-tls1_3"
+    try
+      let cfg := { base with serverName := some "localhost", expectedCertSha256 := pin }
+      ok := (← expectFailure s!"CN-only identity (pinned={pin.isSome})" "mismatch"
+        cfg "127.0.0.1" port 20) && ok
+    finally
+      try child.kill catch _ => pure ()
+      _ ← child.wait
+  let port ← findFreePort
+  let child ← spawnServerWith port "server-dns" dir "-tls1_3"
+  try
+    ok := (← expectFailure "IP identity requires IP SAN" "mismatch"
+      base "127.0.0.1" port 20) && ok
+  finally
+    try child.kill catch _ => pure ()
+    _ ← child.wait
+  pure ok
+
+/-- GNU stat observes every permission/special bit, not only read access. -/
+def keyMode (path : String) : IO String := do
+  let out ← IO.Process.output { cmd := "stat", args := #["-c", "%a", path] }
+  if out.exitCode != 0 then throw (IO.userError s!"stat key mode failed: {out.stderr}")
+  pure out.stdout.trimAscii.toString
+
+def chmodKey (path mode : String) : IO IO.Process.Output :=
+  IO.Process.output { cmd := "chmod", args := #[mode, path] }
+
+/-- Run on a real POSIX filesystem (the test creates its files in /tmp).
+Every established mode and the key text must survive admission unchanged. -/
+def testExactKeyModes (dir : String) : IO Bool := do
+  let key := dir ++ "/mode-test.key"
+  let original ← IO.FS.readFile (dir ++ "/client.key")
+  IO.FS.writeFile key original
+  let cfg : ServerMode.TlsClientConfig :=
+    { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := key }
+  try
+    let modeSet ← chmodKey key "600"
+    let mut ok ← check "key mode 0600 established"
+      (modeSet.exitCode == 0 && (← keyMode key) == "600")
+    ok := (← withServer dir fun port => do
+      let t ← retryConnect cfg "127.0.0.1" port 20
+      try
+        t.send "racecar"
+        check "exact key mode 0600 accepts mTLS" ((← t.recv) == some "racecar")
+      finally
+        let _ ← t.close
+        pure ()) && ok
+    ok := (← check "accepted key bytes/mode unchanged"
+      ((← IO.FS.readFile key) == original && (← keyMode key) == "600")) && ok
+    let rejected ← withoutConnection "rejected POSIX key modes" fun port => do
+      let mut result := true
+      for (mode, special) in #[("400", false), ("700", false), ("640", false),
+          ("604", false), ("644", false), ("4600", true), ("2600", true), ("1600", true)] do
+        let chmodResult ← chmodKey key mode
+        let actual ← keyMode key
+        if chmodResult.exitCode != 0 || actual != mode then
+          if special then
+            IO.println s!"SKIP  unsupported special key mode {mode}: observed {actual}; {chmodResult.stderr}"
+          else
+            result := (← check s!"key mode {mode} established (observed {actual})" false) && result
+        else
+          result := (← expectFailure s!"key mode {mode} rejected"
+            "must have exact POSIX mode 0600" cfg "127.0.0.1" port 0) && result
+          result := (← check s!"rejected key {mode} bytes/mode unchanged"
+            ((← IO.FS.readFile key) == original && (← keyMode key) == mode)) && result
+      pure result
+    pure (ok && rejected)
+  finally
+    let _ ← chmodKey key "600"
+    IO.FS.removeFile key
+
 /-! ## Phase 3: pinned discovery (connectMirrorDiscovered) -/
 
 /-- In-process stub registry: accepts one connection and responds with `resp`. -/
@@ -200,7 +352,7 @@ This is deliberately **not** a bind/connect probe: Lean 4.33's
 GC), so a bind-probe socket can outlive its scope and the real server then
 dies with EADDRINUSE; and a connect probe would be accepted by
 `s_server -naccept 1` and consume the test's single connection. -/
-def waitReady (port : UInt16) : IO Unit := do
+def waitReady (_port : UInt16) : IO Unit := do
   IO.sleep 400
 
 /-- Retry `connectMirrorDiscovered` while the freshly spawned s_server
@@ -317,6 +469,10 @@ def main : IO UInt32 := do
   IO.println "PASS  ephemeral PKI generated"
   let dir := dir.toString
 
+  ok := (← testEmptyIdentity dir) && ok
+  ok := (← testIdentityAndPins dir) && ok
+  ok := (← testExactKeyModes dir) && ok
+
   -- 1. happy path: send a palindrome, receive it echoed back (reversed).
   ok := ok && (← withServer dir fun port => do
     let cfg : ServerMode.TlsClientConfig :=
@@ -361,7 +517,7 @@ def main : IO UInt32 := do
         serverName := some "wrong.example" }
     expectFailure "hostname mismatch: rejected" "mismatch" cfg "127.0.0.1" port 20)
 
-  -- 6. group/other-readable key file is rejected before connecting.
+  -- 6. CN fallback is forbidden even when the CA and CN are correct.
   ok := ok && (← do
     let port ← findFreePort
     let child ← spawnServerWith port "server-cn" dir "-tls1_3"
@@ -373,32 +529,6 @@ def main : IO UInt32 := do
       cfg "127.0.0.1" port 20
     cleanupServer child
     pure res)
-
-  -- 7. group/other-readable key file is rejected before connecting.
-  ok := ok && (← do
-    let looseKey := dir ++ "/loose.key"
-    let cp ← IO.Process.output
-      { cmd := "sh", args := #["-c", s!"cp {dir}/client.key {looseKey} && chmod 644 {looseKey}"],
-        stdin := .piped, stdout := .piped, stderr := .piped }
-    if cp.exitCode != 0 then
-      IO.println s!"FAIL  key-permission setup: {cp.stderr}"
-      pure false
-    else
-      let cfg : ServerMode.TlsClientConfig :=
-        { caFile := dir ++ "/ca.crt", certFile := dir ++ "/client.crt", keyFile := looseKey }
-      -- no server needed: the permission check happens before any connect
-      try
-        let _ ← ServerMode.connectMirrorTls cfg "127.0.0.1" 1
-        IO.println "FAIL  key permission: connect unexpectedly succeeded"
-        pure false
-      catch e =>
-        let msg := toString e
-        if msg.contains "must not be readable" then do
-          IO.println "PASS  key permission: group/other-readable key rejected"
-          pure true
-        else do
-          IO.println s!"FAIL  key permission: error {repr msg}"
-          pure false)
 
   -- 8. (T4) client cert signed by an unrelated CA: the server (started with
   -- `-Verify 1 -verify_return_error` against ca.crt) rejects the handshake.

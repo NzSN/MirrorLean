@@ -284,9 +284,12 @@ let t : Target := .transport (← ServerMode.connectMirrorDiscovered cfg "http:/
 ```
 
 Key points: TLS 1.3 only; the server is verified against the CA and SAN only
-(CN fallback is disabled; IP literals require IP SAN and omit SNI); the client
+(CN fallback is disabled; IP literals require IP SAN and omit SNI). `serverName`
+defaults to the connection host; its effective value must be nonempty. An explicit
+empty override is rejected before credential loading or socket acquisition, even
+with a matching fingerprint pin. The client
 presents `certFile`/`keyFile` (key must be mode
-`0600` on POSIX); a `cert-sha256` fingerprint is checked after the handshake
+exactly `0600` on POSIX, including all permission/special bits); a `cert-sha256` fingerprint is checked after the handshake
 and closes the connection on mismatch (registry pinning is fail-closed);
 client-certificate expiry (< 7 days) warns on stderr; the TLS handshake is
 bounded by a 10 s timeout (override with
@@ -341,8 +344,10 @@ env-driven example (`MIRROR_CA`, `MIRROR_CERT`, `MIRROR_KEY`, `MIRROR_HOST`,
 * **Never commit private keys.** `server-mode/test/gen-test-certs.sh` writes
   into a caller-chosen directory with mode `0600` and is intended for tests
   only; the test suite regenerates a fresh PKI per run into a temp dir.
-* **Key file permissions:** on POSIX the client key must not be readable by
-  group/other (`0600`); the shim refuses to connect otherwise.
+* **Key file permissions:** on POSIX the client key must have exactly mode
+  `0600`, including all permission/special bits; the shim refuses to connect
+  otherwise and never changes the caller's key. Owner-only `0400` and `0700`
+  and special-bit modes are rejected as well as group/other permissions.
 * **Certificates expire:** the client warns on stderr when its certificate
   is expired or expires within 7 days. ModelMirrors refuses to start with
   an expiring server certificate.
@@ -564,7 +569,8 @@ generate-and-replay, and validation scenarios; it defaults to
 
 The server-mode package (`server-mode/`) continuously verifies the mTLS +
 discovery stack (test matrix T2–T15 of `plans/server-mode.md`). It needs
-OpenSSL dev headers to build (`apt install libssl-dev openssl` on Ubuntu);
+OpenSSL dev headers to build (`apt install libssl-dev openssl` on Ubuntu) and
+`python3` for the bounded listener assertions in the TLS test;
 the baseline build does not.
 
 ```bash
@@ -574,7 +580,7 @@ lake build server-mode-test server-mode-test-discovery \
 .lake/build/bin/server-mode-test          # loopback TLS tests
                                           #   (openssl s_server TLS peer, no apalache):
                                           #   happy path, wrong CA, missing/invalid
-                                          #   client cert, hostname/CN-only rejection, TLS 1.2
+                                          #   client cert, DNS/IP SAN, empty/CN-only rejection, TLS 1.2
                                           #   peer, fingerprint pin, key-file mode,
                                           #   EOF mid-session, pinned discovery
 .lake/build/bin/server-mode-test-discovery  # stub-registry tests (in-process
@@ -692,3 +698,24 @@ Run `lake build test smoke async-test`, the unit binary, and `async-test` with
 `MIRROR_BIN` / `APALACHE_MC` set for real concurrent TCP coverage. The separate
 server-mode smoke includes the same async lifecycle over mTLS. No model-interface
 negotiation/generated Lean binding or native Gate facade is claimed yet.
+
+### Client conformance corrections (2026-10-15)
+
+TLS admission now rejects an empty effective server identity before loading
+credentials or opening a socket, including an explicit `serverName := some ""`
+with a matching certificate pin. Supply the intended nonempty DNS name or IP
+identity, or leave the override absent to use the connection host. POSIX client
+keys now require exactly `0600`; modes such as `0400`, `0700` and special-bit
+variants that were previously admitted are rejected with an actionable error.
+The client never changes key bytes or permissions.
+
+Inline TLA+ dependency discovery preserves quoted comment markers and escaped
+characters while ignoring quoted dependency keywords. Real nested and line
+comments remain inert; emitted sources retain their original contents and
+root-first dependency order. The complete encoded registration still has its
+separate 65,535-byte protocol bound.
+
+The convenience protocol decoder now treats absent and JSON `null` optional
+strings alike for configuration fields, trace views and mismatch actions.
+Present nonstrings still fail decoding. Typed outbound encoding continues to
+omit absent fields, so this convenience change does not change wire output.

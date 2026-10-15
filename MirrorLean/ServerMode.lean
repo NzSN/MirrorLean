@@ -34,9 +34,10 @@ structure TlsClientConfig where
   caFile : System.FilePath
   /-- PEM client certificate presented to the server. -/
   certFile : System.FilePath
-  /-- PEM client private key (must not be group/other readable on POSIX). -/
+  /-- PEM client private key (must have exactly mode 0600 on POSIX). -/
   keyFile : System.FilePath
-  /-- SNI + hostname-verification name; defaults to the connection host. -/
+  /-- Nonempty SNI + SAN-verification name; defaults to the connection host.
+      An explicit empty override is rejected before any connection. -/
   serverName : Option String := none
   /-- Optional `cert-sha256` fingerprint (lowercase hex) pinned after the
       handshake; a mismatch closes the connection before any traffic. -/
@@ -97,9 +98,10 @@ Connect to a TLS 1.3 server with mutual authentication and return a normal
 `Transport`.
 
 * Server is verified against `cfg.caFile` and the hostname/SAN
-  (`cfg.serverName` defaults to `host`; also used for SNI).
+  (`cfg.serverName` defaults to `host`; also used for SNI). The effective
+  name must be nonempty, including when an override is supplied.
 * The client presents `cfg.certFile`/`cfg.keyFile`; on POSIX the key file
-  must not be readable by group/other (0600).
+  must have exactly mode 0600, including permission and special bits.
 * If `cfg.expectedCertSha256` is set, the peer certificate's SHA-256 is
   compared after the handshake; a mismatch closes the connection before
   any protocol traffic.
@@ -109,6 +111,8 @@ Connect to a TLS 1.3 server with mutual authentication and return a normal
 -/
 def connectMirrorTls (cfg : TlsClientConfig) (host : String) (port : UInt16) : IO Transport := do
   let serverName := cfg.serverName.getD host
+  if serverName.isEmpty then
+    tlsFail "connectMirrorTls" "TLS server identity must be nonempty"
   let (err, h) ← tlsConnect cfg.caFile.toString cfg.certFile.toString cfg.keyFile.toString serverName host port
   if h == 0 then
     tlsFail "connectMirrorTls" (if err.isEmpty then "TLS connect returned no handle" else err)

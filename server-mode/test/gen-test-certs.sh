@@ -29,6 +29,16 @@ openssl x509 -req -in "$OUT/server.csr" \
   -out "$OUT/server.crt" -days 2 \
   -extfile <(printf '%b\n' "$SERVEREXT") >/dev/null 2>&1
 
+# --- DNS-only SAN (an IP request must not match the CN or DNS SAN) ---------
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$OUT/server-dns.key" -out "$OUT/server-dns.csr" \
+  -subj "/CN=127.0.0.1" >/dev/null 2>&1
+DNSEXT="basicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost"
+openssl x509 -req -in "$OUT/server-dns.csr" \
+  -CA "$OUT/ca.crt" -CAkey "$OUT/ca.key" -CAcreateserial \
+  -out "$OUT/server-dns.crt" -days 2 \
+  -extfile <(printf '%b\n' "$DNSEXT") >/dev/null 2>&1
+
 # --- CN-only server certificate (negative SAN-identity test) -------------
 openssl req -newkey rsa:2048 -nodes \
   -keyout "$OUT/server-cn.key" -out "$OUT/server-cn.csr" \
@@ -80,6 +90,6 @@ openssl x509 -req -in "$OUT/client-bad.csr" \
   -out "$OUT/client-bad.crt" -days 2 \
   -extfile <(printf '%b\n' "$CLIENTEXT") >/dev/null 2>&1
 
-chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/server-cn.key" "$OUT/server2.key" "$OUT/client.key" "$OUT/ca2.key" "$OUT/client-bad.key"
+chmod 600 "$OUT/ca.key" "$OUT/server.key" "$OUT/server-dns.key" "$OUT/server-cn.key" "$OUT/server2.key" "$OUT/client.key" "$OUT/ca2.key" "$OUT/client-bad.key"
 rm -f "$OUT"/*.csr "$OUT/ca.srl" "$OUT/ca2.srl"
 echo "$OUT"

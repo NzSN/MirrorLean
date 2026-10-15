@@ -71,8 +71,8 @@ static void append_ssl_errors(char *buf, size_t len) {
 /* --------------------- POSIX key-file permissions ---------------------- */
 
 /*
- * Reject private key files readable by group/other (0600), as the
- * upstream client does. Windows: skipped (no POSIX mode bits).
+ * Require exactly 0600, including permission and special bits.
+ * Windows: skipped (no POSIX mode bits).
  */
 static int check_key_permissions(const char *key_file, char *errbuf,
                                  size_t errbuf_len) {
@@ -83,10 +83,10 @@ static int check_key_permissions(const char *key_file, char *errbuf,
             key_file, strerror(errno));
     return -1;
   }
-  if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+  if ((st.st_mode & 07777) != 0600) {
     set_err(errbuf, errbuf_len,
-            "key file '%s' must not be readable by group/others (mode %04o; chmod 600)",
-            key_file, (unsigned)(st.st_mode & 0777));
+            "key file '%s' must have exact POSIX mode 0600 (mode %04o; chmod 600)",
+            key_file, (unsigned)(st.st_mode & 07777));
     return -1;
   }
 #else
@@ -170,6 +170,13 @@ mirrorlean_tls *mirrorlean_tls_connect(
     char *errbuf, size_t errbuf_len) {
   errbuf[0] = '\0';
 
+  /* Public native callers must not bypass SAN verification with an empty
+   * identity. Check before credentials, TLS allocation, DNS, or sockets. */
+  if (server_name == NULL || *server_name == '\0') {
+    set_err(errbuf, errbuf_len, "TLS server identity must be nonempty");
+    return NULL;
+  }
+
   if (check_key_permissions(key_file, errbuf, errbuf_len) != 0)
     return NULL;
 
@@ -243,29 +250,27 @@ mirrorlean_tls *mirrorlean_tls_connect(
   /* SAN-only server identity verification. DNS names use SNI and a DNS SAN;
    * IP literals omit SNI and require an IP SAN. Legacy CN fallback is never
    * accepted. */
-  if (server_name != NULL && *server_name != '\0') {
-    struct in_addr a4;
-    struct in6_addr a6;
-    int is_ip = inet_pton(AF_INET, server_name, &a4) == 1 ||
-                inet_pton(AF_INET6, server_name, &a6) == 1;
-    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
-    int identity_ok;
-    if (is_ip) {
-      identity_ok = X509_VERIFY_PARAM_set1_ip_asc(param, server_name);
-    } else {
-      X509_VERIFY_PARAM_set_hostflags(
-          param, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
-      identity_ok = SSL_set_tlsext_host_name(ssl, server_name) == 1 &&
-                    SSL_set1_host(ssl, server_name) == 1;
-    }
-    if (identity_ok != 1) {
-      set_err(errbuf, errbuf_len,
-              "cannot set SAN identity verification for '%s'", server_name);
-      SSL_free(ssl);
-      close(fd);
-      SSL_CTX_free(ctx);
-      return NULL;
-    }
+  struct in_addr a4;
+  struct in6_addr a6;
+  int is_ip = inet_pton(AF_INET, server_name, &a4) == 1 ||
+              inet_pton(AF_INET6, server_name, &a6) == 1;
+  X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+  int identity_ok;
+  if (is_ip) {
+    identity_ok = X509_VERIFY_PARAM_set1_ip_asc(param, server_name);
+  } else {
+    X509_VERIFY_PARAM_set_hostflags(
+        param, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+    identity_ok = SSL_set_tlsext_host_name(ssl, server_name) == 1 &&
+                  SSL_set1_host(ssl, server_name) == 1;
+  }
+  if (identity_ok != 1) {
+    set_err(errbuf, errbuf_len,
+            "cannot set SAN identity verification for '%s'", server_name);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(ctx);
+    return NULL;
   }
 
   if (SSL_connect(ssl) != 1) {

@@ -1,0 +1,3 @@
+---- MODULE LexicalShared ----
+INSTANCE LexicalRoot
+====

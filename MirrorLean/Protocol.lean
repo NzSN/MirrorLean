@@ -44,8 +44,11 @@ private def getArrField (j : Lean.Json) (k : String) : Except String (Array Lean
   let jv ← j.getObjVal? k
   Lean.Json.getArr? jv
 
-private def getStrOpt (j : Lean.Json) (k : String) : Except String (Option String) := 
+/-- Optional strings follow Haskell `.:?`: absent and null both mean none;
+present non-null values must be strings. Outbound omission is independent. -/
+private def getStrOpt (j : Lean.Json) (k : String) : Except String (Option String) :=
   match j.getObjVal? k with
+  | .ok .null => .ok none
   | .ok jv => (some <$> jv.getStr?)
   | .error _ => .ok none
 
@@ -124,7 +127,7 @@ def toJson (c : ApalacheConfig) : Lean.Json :=
 instance : Lean.ToJson ApalacheConfig := ⟨toJson⟩
 
 /-- Decode an ApalacheConfig from its JSON object, applying the mirror's
-defaults for absent optional fields. -/
+defaults for absent or null optional string fields. -/
 def ofJson? (j : Lean.Json) : Except String ApalacheConfig := do
   let specPathJ ← j.getObjVal? "specPath"
   let specPath ← Lean.Json.getStr? specPathJ

@@ -184,8 +184,68 @@ def tcNone : TraceGenerationConfig := { numTraces := 1, view := none }
 
 def sampleState : State := State.ofList [("x", Value.int 1), ("s", Value.str "hi")]
 
+/-- Convenience decoding accepts absent/null optional strings, but typed
+outbound messages still omit none and reject all nonstring alternatives. -/
+def testNullableConfigOptions : IO Bool := do
+  let fields := #["initPredicate", "nextPredicate", "constInit", "paramVars"]
+  let base := [("specPath", Lean.Json.str "spec.tla"),
+    ("invariant", Lean.Json.str "Inv"), ("lengthBound", Lean.toJson (10 : Nat))]
+  let encodeConfig (extras : List (String × Lean.Json)) : Except String String := do
+    let cfg ← ApalacheConfig.ofJson? (Lean.Json.mkObj (base ++ extras))
+    pure (Lean.Json.compress (ApalacheConfig.toJson cfg))
+  let omitted := Lean.Json.compress (ApalacheConfig.toJson cfgNone)
+  let mut ok ← checkEq "config absent optionals decode with outbound omission"
+    ((encodeConfig []).toOption.getD "DECODE-ERROR") omitted
+  for field in fields do
+    ok := (← checkEq s!"config {field}: null equals absent"
+      ((encodeConfig [(field, .null)]).toOption.getD "DECODE-ERROR") omitted) && ok
+    for text in #["Configured", ""] do
+      let expected := Lean.Json.compress (Lean.Json.mkObj (base ++ [(field, .str text)]))
+      ok := (← checkEq s!"config {field}: string retained ({repr text})"
+        ((encodeConfig [(field, .str text)]).toOption.getD "DECODE-ERROR") expected) && ok
+    for malformed in #[Lean.Json.bool true, Lean.toJson (1 : Nat),
+        Lean.Json.arr #[], Lean.Json.mkObj []] do
+      ok := (← checkErr s!"config {field}: nonstring rejected ({malformed.compress})"
+        (encodeConfig [(field, malformed)])) && ok
+  let allNull := fields.toList.map (fun field => (field, Lean.Json.null))
+  match ApalacheConfig.ofJson? (Lean.Json.mkObj (base ++ allNull)) with
+  | .error _ => ok := (← check "config all null optionals decode" false) && ok
+  | .ok cfg =>
+      ok := (← checkEq "null config register re-encodes with original typed omission"
+        (ClientMessage.encode (.register cfg tcNone none))
+        (ClientMessage.encode (.register cfgNone tcNone none))) && ok
+  pure ok
+
+/-- The shared helper also serves trace view and mismatch action: retain
+their nullable optional behavior and reject malformed present values. -/
+def testOtherNullableStrings : IO Bool := do
+  let mut ok := true
+  for (label, extra, expected) in #[
+      ("absent", [], none), ("null", [("view", Lean.Json.null)], none),
+      ("string", [("view", Lean.Json.str "counts")], some "counts")] do
+    let decoded := TraceGenerationConfig.ofJson? (Lean.Json.mkObj (("numTraces", Lean.toJson (1 : Nat)) :: extra))
+    ok := (← check s!"trace view optional string: {label}" (match decoded with
+      | .ok cfg => cfg.view == expected
+      | .error _ => false)) && ok
+  ok := (← checkErr "trace view nonstring rejected"
+    (TraceGenerationConfig.ofJson? (Lean.Json.mkObj [("view", .bool true)]))) && ok
+  let mismatchBase : List (String × Lean.Json) :=
+    [("proto_step", .str "step_mismatch"), ("expected", Lean.Json.mkObj []), ("actual", Lean.Json.mkObj [])]
+  for (label, extra, expected) in #[
+      ("absent", [], none), ("null", [("action", Lean.Json.null)], none),
+      ("string", [("action", Lean.Json.str "Next")], some "Next")] do
+    ok := (← check s!"mismatch action optional string: {label}"
+      (match MirrorMessage.ofJson? (Lean.Json.mkObj (mismatchBase ++ extra)) with
+      | .ok (.stepMismatch action _ _ _) => action == expected
+      | _ => false)) && ok
+  ok := (← checkErr "mismatch action nonstring rejected"
+    (MirrorMessage.ofJson? (Lean.Json.mkObj (mismatchBase ++ [("action", .bool true)])))) && ok
+  pure ok
+
 def testClientMessages : List (String × IO Bool) :=
   [
+    ("config nullable optional strings", testNullableConfigOptions),
+    ("shared nullable optional strings", testOtherNullableStrings),
     ("register no spec", checkEq "register" (clientRoundTrip (.register sampleCfg sampleTC none))
         (ClientMessage.encode (.register sampleCfg sampleTC none))),
     ("register with spec", checkEq "register+spec" (clientRoundTrip (.register sampleCfg sampleTC (some sampleSpec)))
@@ -645,21 +705,27 @@ def testSpecWithInst : IO Bool := do
 /-- A WithInst variant whose WITH substitution carries a comma: the scanner
 must still resolve only DepA (never the substitution names). -/
 def testSpecWithInstComma : IO Bool := do
-  -- build a temp module text in tmp/ exercising the comma case
+  -- Use an owned temp directory so a clean checkout needs no scratch setup.
   let text := "---- MODULE WithInstComma ----
 INSTANCE DepA WITH x <- 1, y <- 2
 ===="
-  IO.FS.writeFile (System.FilePath.mk "tmp/WithInstComma.tla") text
-  let r ← specFromFiles (System.FilePath.mk "tmp/WithInstComma.tla") #[System.FilePath.mk "test/fixtures/root"]
-  match r with
-  | .error _ =>
-      check "spec inst comma: error" false
-  | .ok spec =>
-      let a ← checkEq "spec inst comma: 3 sources" (toString spec.sources.size) "3"
-      let b ← check "spec inst comma: root first" (srcHasModule spec 0 "WithInstComma")
-      let c ← check "spec inst comma: DepA second" (srcHasModule spec 1 "DepA")
-      let d ← check "spec inst comma: DepB third" (srcHasModule spec 2 "DepB")
-      pure (a && b && c && d)
+  let dir ← IO.FS.createTempDir
+  let root := dir / "WithInstComma.tla"
+  IO.FS.writeFile root text
+  try
+    let r ← specFromFiles root #[System.FilePath.mk "test/fixtures/root"]
+    match r with
+    | .error _ =>
+        check "spec inst comma: error" false
+    | .ok spec =>
+        let a ← checkEq "spec inst comma: 3 sources" (toString spec.sources.size) "3"
+        let b ← check "spec inst comma: root first" (srcHasModule spec 0 "WithInstComma")
+        let c ← check "spec inst comma: DepA second" (srcHasModule spec 1 "DepA")
+        let d ← check "spec inst comma: DepB third" (srcHasModule spec 2 "DepB")
+        pure (a && b && c && d)
+  finally
+    IO.FS.removeFile root
+    IO.FS.removeDir dir
 
 def testSpecAdvancedForms : IO Bool := do
   let r ← specFromFile (System.FilePath.mk "test/fixtures/root/Advanced.tla")
@@ -724,6 +790,71 @@ def testSpecMissing : IO Bool := do
   | .ok _ =>
       check "spec missing: errors" false
 
+def testSpecCommentLexing : IO Bool := do
+  let quoted := "\"(* \\\\* \\\" *) INSTANCE MissingQuoted\""
+  let a ← checkEq "comment scanner preserves quoted markers and escapes"
+    (stripComments quoted) quoted
+  let b ← checkEq "comment scanner separates nested block comments"
+    (stripComments "INSTANCE(* outer \" (* nested *) \"\n*)DepA") "INSTANCE \nDepA"
+  let c ← checkEq "comment scanner preserves line-comment newline"
+    (stripComments "EXTENDS\\* INSTANCE Missing\nDepA") "EXTENDS \nDepA"
+  pure (a && b && c)
+
+/-- Exercise the public resolver, retaining exact original source contents,
+root-first BFS order, shared dependencies and a cycle back to the root. -/
+def testSpecQuotedClosure : IO Bool := do
+  let dir := System.FilePath.mk "test/fixtures/scanner"
+  let names := #["LexicalRoot", "LexicalA", "LexicalB", "LexicalShared"]
+  let expected ← names.mapM fun name => IO.FS.readFile (dir / (name ++ ".tla"))
+  let r ← specFromFiles (dir / "LexicalRoot.tla") #[dir]
+  match r with
+  | .error e =>
+      IO.println (SpecError.toString e)
+      check "quoted closure resolves real dependencies without quoted/comment ghosts" false
+  | .ok spec => do
+      let a ← check "quoted closure: exact original sources in BFS order"
+        (spec.sources == expected)
+      let b ← check "quoted closure: final inline registration accepted"
+        (← protocolLineAccepted (ClientMessage.encode (.register cfgNone tcNone (some spec))))
+      pure (a && b)
+
+def testSpecCommentBoundaryClosure : IO Bool := do
+  let dir := System.FilePath.mk "test/fixtures/scanner"
+  let expected ← #["Boundary", "BoundaryDep"].mapM fun name =>
+    IO.FS.readFile (dir / (name ++ ".tla"))
+  match ← specFromFiles (dir / "Boundary.tla") #[dir] with
+  | .error _ => check "comment boundary: real INSTANCE dependency resolved" false
+  | .ok spec => check "comment boundary: exact source closure" (spec.sources == expected)
+
+def testSpecMissingAfterMarker : IO Bool := do
+  let dir := System.FilePath.mk "test/fixtures/scanner"
+  match ← specFromFiles (dir / "MissingAfterMarker.tla") #[dir] with
+  | .error e =>
+      check "marker string cannot hide a missing real dependency"
+        (e.msg.contains "MissingReal" && e.msg.contains "not found")
+  | .ok _ => check "marker string cannot hide a missing real dependency" false
+
+/-- Discovery does not enforce a wire bound: the final encoded registration
+does, including JSON escaping and the complete dependency closure. -/
+def testSpecInlineRegistrationBound : IO Bool := do
+  let dir ← IO.FS.createTempDir
+  let root := dir / "LargeSource.tla"
+  let source := "---- MODULE LargeSource ----\n\\* " ++
+    String.ofList (List.replicate 65535 'x') ++ "\n====\n"
+  IO.FS.writeFile root source
+  try
+    match ← specFromFiles root #[dir] with
+    | .error _ => check "inline byte bound is separate from source discovery" false
+    | .ok spec => do
+        let a ← check "large source discovery retains original text" (spec.sources == #[source])
+        let encoded := ClientMessage.encode (.register cfgNone tcNone (some spec))
+        let b ← check "final inline registration byte overflow rejected"
+          (encoded.toUTF8.size > maxProtocolLineBytes && !(← protocolLineAccepted encoded))
+        pure (a && b)
+  finally
+    IO.FS.removeFile root
+    IO.FS.removeDir dir
+
 def testSpecClosure : List (String × IO Bool) :=
   [
     ("spec root closure", testSpecRootClosure),
@@ -736,6 +867,11 @@ def testSpecClosure : List (String × IO Bool) :=
     ("spec TLA_LIBRARY_PATH lookup", testSpecTlaLibraryPath),
     ("spec ambiguity error", testSpecAmbiguity),
     ("spec missing module error", testSpecMissing),
+    ("spec string-aware comment stripping", testSpecCommentLexing),
+    ("spec quoted marker closure", testSpecQuotedClosure),
+    ("spec comment token boundary", testSpecCommentBoundaryClosure),
+    ("spec missing real module after marker", testSpecMissingAfterMarker),
+    ("spec inline registration byte bound", testSpecInlineRegistrationBound),
   ]
 
 -- --------------------------------------------------------------------------

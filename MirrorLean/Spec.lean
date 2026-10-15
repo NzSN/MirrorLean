@@ -43,20 +43,27 @@ private def dropUntilNewline : List Char → List Char
   | '\n' :: rest => '\n' :: rest
   | _ :: rest => dropUntilNewline rest
 
-/-- Strip TLA+ comments from a source text: \\* line comments and nested
-(* ... *) block comments. Runs a full character scan and keeps newlines. -/
-private partial def stripCommentsAux : List Char → Nat → List Char → List Char
-  | [], _, acc => acc.reverse
-  | '(' :: '*' :: rest, 0, acc => stripCommentsAux rest 1 acc
-  | '(' :: '*' :: rest, d+1, acc => stripCommentsAux rest (d + 2) acc
-  | '*' :: ')' :: rest, d+1, acc => stripCommentsAux rest d acc
-  | '\\' :: '*' :: rest, 0, acc => stripCommentsAux (dropUntilNewline rest) 0 acc
-  | _ :: rest, d+1, acc => stripCommentsAux rest (d + 1) acc
-  | c :: rest, 0, acc => stripCommentsAux rest 0 (c :: acc)
+/-- Strip comments while preserving strings, escaped characters, newlines,
+and token boundaries. Quotes inside a block comment are ordinary comment
+text; comment delimiters inside a quoted string are ordinary string text. -/
+private partial def stripCommentsAux : List Char → Nat → Bool → List Char → List Char
+  | [], _, _, acc => acc.reverse
+  | '(' :: '*' :: rest, d+1, _, acc => stripCommentsAux rest (d + 2) false acc
+  | '*' :: ')' :: rest, d+1, _, acc => stripCommentsAux rest d false acc
+  | '\n' :: rest, d+1, _, acc => stripCommentsAux rest (d + 1) false ('\n' :: acc)
+  | _ :: rest, d+1, _, acc => stripCommentsAux rest (d + 1) false acc
+  | '\\' :: c :: rest, 0, true, acc => stripCommentsAux rest 0 true (c :: '\\' :: acc)
+  | '"' :: rest, 0, true, acc => stripCommentsAux rest 0 false ('"' :: acc)
+  | c :: rest, 0, true, acc => stripCommentsAux rest 0 true (c :: acc)
+  | '"' :: rest, 0, false, acc => stripCommentsAux rest 0 true ('"' :: acc)
+  | '(' :: '*' :: rest, 0, false, acc => stripCommentsAux rest 1 false (' ' :: acc)
+  | '\\' :: '*' :: rest, 0, false, acc =>
+      stripCommentsAux (dropUntilNewline rest) 0 false (' ' :: acc)
+  | c :: rest, 0, false, acc => stripCommentsAux rest 0 false (c :: acc)
 
 /-- Strip all TLA+ comments from a source text. -/
 def stripComments (s : String) : String :=
-  String.ofList (stripCommentsAux s.toList 0 [])
+  String.ofList (stripCommentsAux s.toList 0 false [])
 
 /-- Skip a quoted TLA+ string, including escaped characters. -/
 private partial def skipString : List Char → List Char
