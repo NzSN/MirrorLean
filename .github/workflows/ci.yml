@@ -20,7 +20,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
           sh elan-init.sh -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          elan toolchain install leanprover/lean4:v4.33.0
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.0
 
       - name: Cache .lake
         uses: actions/cache@v4
@@ -68,7 +68,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
           sh elan-init.sh -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          elan toolchain install leanprover/lean4:v4.33.0
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.33.0
 
       - name: Install OpenSSL dev headers + openssl
         run: |

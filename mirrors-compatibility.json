@@ -31,10 +31,10 @@
       "wrong-server-pin-before-compute"
     ],
     "actualRows": 7,
-    "sourceTreeSha256": "c3674b18a6a604d352d5ecaaf84d2cab5cddab2dd25df336b1e57c7189801f37",
+    "sourceTreeSha256": "c25d284119d1956d25fd259bfe3498772f4cf426b93fdd5a7941dcc04d5af082",
     "evidence": {
       "url": "https://github.com/NzSN/Mirrors/blob/main/Plans/version-migration-2026-10-22/evidence/transport-compatibility.json",
-      "sha256": "2d4a5dd29faf64709213b764a0c10d81dd7c5455b388a2b452a94e5da2835072"
+      "sha256": "40c2dafdc9afb061738e70e26d38baf42dee0ebbb143bac810587c258314fa0b"
     }
   },
   "limits": [
