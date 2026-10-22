@@ -57,7 +57,7 @@ target native_spike (pkg : NPackage __name__) : FilePath := do
   -- `-nostdinc` (no system include dirs), so we use the system `cc`, which
   -- searches `/usr/include` by default, and add Lean's include dir on top.
   buildFileAfterDep oFile srcJob fun src => do
-    compileO oFile src #["-I", lean.includeDir.toString, "-fPIC"] "cc"
+    compileO oFile src #["-I", lean.includeDir.toString, "-fPIC", "-std=gnu17"] "cc"
 
 /--
 Spike executable: proves the build mechanics end to end.
@@ -86,7 +86,7 @@ target native_tls (pkg : NPackage __name__) : FilePath := do
   let oFile : FilePath := pkg.buildDir / "native" / "mirrorlean_tls.o"
   let srcJob ← inputFile (pkg.dir / "native" / "mirrorlean_tls.c") false
   buildFileAfterDep oFile srcJob fun src => do
-    compileO oFile src #["-I", lean.includeDir.toString, "-fPIC"] "cc"
+    compileO oFile src #["-I", lean.includeDir.toString, "-fPIC", "-std=gnu17"] "cc"
 
 /-
 Structural note (Lake 5 namespace ownership, Phase 1 finding): a
