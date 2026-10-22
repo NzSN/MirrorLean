@@ -1,0 +1,46 @@
+{
+  "schema": "mirrors.component-compatibility/v1",
+  "component": {
+    "repository": "NzSN/MirrorLean",
+    "version": "0.1.0",
+    "releaseTag": "v0.1.0",
+    "sourceParent": "196a58702ffc6b3f400d02431b98a66967260a15"
+  },
+  "server": {
+    "repository": "NzSN/Mirrors",
+    "tag": "v0.1.0",
+    "revision": "ea8091c0c723f3f561044a5c1efb91d12e7aaf5f",
+    "formerTag": "v0.0.3.3",
+    "embeddedVersion": "v0.0.3.2",
+    "binarySha256": "53bd92420e101567a6a76b0e80fc9786b6496e3af98a32f2ee2f5ea35de65082"
+  },
+  "compatibility": {
+    "status": "verified-for-declared-profile",
+    "profile": "supplied-trace-client/v1",
+    "transports": [
+      "stdio",
+      "tcp",
+      "tls1.3-mutual-auth"
+    ],
+    "operations": [
+      "register_traces",
+      "report_state"
+    ],
+    "controls": [
+      "actual-state-mismatch",
+      "wrong-server-pin-before-compute"
+    ],
+    "actualRows": 7,
+    "sourceTreeSha256": "c3674b18a6a604d352d5ecaaf84d2cab5cddab2dd25df336b1e57c7189801f37",
+    "evidence": {
+      "url": "https://github.com/NzSN/Mirrors/blob/main/Plans/version-migration-2026-10-22/evidence/transport-compatibility.json",
+      "sha256": "2d4a5dd29faf64709213b764a0c10d81dd7c5455b388a2b452a94e5da2835072"
+    }
+  },
+  "limits": [
+    "Live model generation/validation/exploration not exercised in this campaign.",
+    "Exact model-interface digests remain required.",
+    "The frozen compiler has no Lean emitter or later async-ECMA/Rust v2 emitters.",
+    "Native TLS compilation explicitly uses GNU17, avoiding the GCC15/glibc C23 strtol symbol mismatch with Lean bundled linker libraries. No baseline compiler Lean-emission claim."
+  ]
+}

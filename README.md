@@ -1,5 +1,7 @@
 # MirrorLean
 
+[Product versions and compatibility](docs/versioning.md).
+
 See the [framework map](../Mirrors/Docs/framework-map.md) for current language support.
 Typed network jobs use [Connection](MirrorLean/Async.lean).
 The `mirrorlean-v1` generated target and exact-key negotiated replay through
